@@ -2,7 +2,7 @@
 
 This repo represents my Nano-GPT speedrun playground, which started coding along [Let's reproduce GPT-2 (124M)](https://www.youtube.com/watch?v=l8pRSuU81PU), then moved into further improvements ([NanoGPT Speedrun Living Worklog](https://www.tylerromero.com/posts/nanogpt-speedrun-worklog/) and [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)) and then own experiments.
 
-Every new file in `versions/` adds some new functionality reflected in its name (chosen over commits over the same file to allow for independent updating in case I have to clean each file up if I ever decide to create a training set with `diff`s between them), while `train_gpt.py` holds the latest/fastest version of the code.
+Every new file in `versions/` adds some new functionality reflected in its name (chosen over commits over the same file to allow for independent updating in case I have to clean each file up if I ever decide to create a training set with `diff`s between them), while `train.py` holds the latest/fastest version of the code.
 
 ## Measurements
 
