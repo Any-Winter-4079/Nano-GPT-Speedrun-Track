@@ -7,7 +7,7 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 ## Measurements
 
 - Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.87 minutes (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
-- [Nov 2, 2025, World record <= 3.28 val loss on _the first 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
+- [Nov 2, 2025, World record <= 3.28 val loss on the first 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
 
 ## Updates
 - While I haven't had much time to play around with this repo lately, I have added 2 new versions, improving this repo's best time to X, now also on the same 10M tokens the official speedrun uses.
@@ -15,19 +15,16 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 
 ### WR vs This Repo Differences
 
-- As some noticeable differences, this repo tries to be more customizable (better for: learning, customization) while the world record code is (a lot) more optimized (Triton kernels, etc.) but also tries to remove anything that hurts performance (e.g., checkpointing, extra logging, etc.)
+- As some noticeable differences, this repo tries to be more customizable (better for: learning, customization) while the world record code is (a lot) more optimized (sometimes at the expense of a bit of readibility/customization, if I may say).
 
 ## Configuration Options
 
 This repo supports toggling between the following config options:
 
-- FlashAttention (sdpa) / FlexAttention
-- Sliding Window Attention (attend to a subset of tokens), Doc Masking (attend to same-doc tokens only), and Attention Logit Soft-capping (if FlexAttention, for performance)
-  - Sliding Window Attention ramp (increase window size over training)
-  - Attention logit soft-capping ("clamp", "ptx" -faster-, "rational" or "exact")
+- FlashAttention / FlexAttention
+- SWA (Sliding Window Attention) and SWA window ramp, doc masking, and attention logit soft-capping (if FlexAttention, for performance)
 - Custom masking (e.g., padding mask if non-causal)
 - AdamW or AdamW and Muon
-  - Muon steps, momentum, use Nesterov
 - MHA/MQA/GQA (n_heads vs n_kv_heads)
 - QK norm (RMS/L2)
 - RMSNorm or LayerNorm
@@ -55,15 +52,6 @@ This repo supports toggling between the following config options:
 - KV cache (for `sample`)
 - Mixture of Experts config option
 - Masked Language Model (MLM) training support (`is_causal=False` -> work as encoder)
-
-- Faster shard-switching (100M tokens/shard) time:
-
-```
-step: 380 | train loss: 3.99275875 | train ppl: 54.20 | train step time: 158.82 ms | adamw lr: 0.00483939 | tok/s: 1,650,578.83 | total toks: 99,876,864 | total time: 0.99 min | sw size: 256 | max q_scale raw/eff: 1.8034/1.8034 | max k_scale raw/eff: 1.8034/1.8034
-step: 381 | train loss: 3.94825888 | train ppl: 51.85 | train step time: 251.45 ms | adamw lr: 0.00483856 | tok/s: 1,042,512.27 | total toks: 100,139,008 | total time: 1.00 min | sw size: 256 | max q_scale raw/eff: 1.8039/1.8039 | max k_scale raw/eff: 1.8039/1.8039
-step: 382 | train loss: 3.97589111 | train ppl: 53.30 | train step time: 159.01 ms | adamw lr: 0.00483772 | tok/s: 1,648,631.07 | total toks: 100,401,152 | total time: 1.00 min | sw size: 256 | max q_scale raw/eff: 1.8043/1.8043 | max k_scale raw/eff: 1.8043/1.8043
-```
-
 - Reward >1 token at the start of training (e.g., I went `swimming` -> reward `swimming`, `running`, `walking`, etc.) and sharpen signal as training goes on
 - ...
 
