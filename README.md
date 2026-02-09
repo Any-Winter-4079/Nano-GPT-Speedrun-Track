@@ -6,7 +6,7 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 
 ## Measurements
 
-- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.87 minutes (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
+- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.87 minutes (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100).
 - [Nov 2, 2025, World record <= 3.28 val loss on the first 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
 
 ## Updates
