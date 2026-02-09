@@ -15,7 +15,7 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 
 ### WR vs This Repo Differences
 
-- As some noticeable differences, this repo tries to be more customizable (better for: learning, customization) while the world record code is (a lot) more optimized (sometimes at the expense of a bit of readibility/customization, if I may say).
+- As some noticeable differences, this repo tries to have more comments and be more customizable (possibly better for: learning, adaptation to other use cases) while the world record code is (a lot) more optimized.
 
 ## Configuration Options
 
