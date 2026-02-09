@@ -1,11 +1,15 @@
-# GPT-3 Small Pretraining Experiments
+# (Own) Nano-GPT-Speedrun-Track
 
-This repo starts coding along [Let's reproduce GPT-2 (124M)](https://www.youtube.com/watch?v=l8pRSuU81PU), then moves into further improvements ([NanoGPT Speedrun Living Worklog](https://www.tylerromero.com/posts/nanogpt-speedrun-worklog/) and [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)) and own experiments. Every new file adds some new functionality (done this way -vs. commits over the same file- to maintain easier updatability of older versions, in case one day I create a training set for an LLM with `diff`s between consecutive files, e.g., 'Add DDP to this code'. However, currently there are _minor_ changes between certain pairs of files beyond what their name suggests, such as minor comment changes, etc., which we'd need to polish to avoid rewarding the language model e.g., for changes outside 'Add DDP to this code')
+This repo starts coding along [Let's reproduce GPT-2 (124M)](https://www.youtube.com/watch?v=l8pRSuU81PU), then moves into further improvements ([NanoGPT Speedrun Living Worklog](https://www.tylerromero.com/posts/nanogpt-speedrun-worklog/) and [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)) and own experiments. Every new file in `versions/` adds some new functionality (done this way -vs. commits over the same file- to maintain easier updatability of older versions, in case one day I create a training set for an LLM with `diff`s between consecutive files, e.g., 'Add DDP to this code'. However, currently there are _minor_ changes between certain pairs of files beyond what their name suggests, such as minor comment changes, etc., which we'd need to polish to avoid rewarding the language model e.g., for changes outside 'Add DDP to this code')
 
 ## Measurements
 
-- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.87 minutes ([config](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251124_211032/blob/main/config.txt), [log](https://huggingface.co/Edue3r4t5y6/gpt-3-small_20251124_211032/raw/main/log.txt)) (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
-- [Nov 2, 2025, World record <= 3.28 val loss on _the first_ 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
+- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.87 minutes (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100s, but it is a bit costly anyway, about $20/h).
+- [Nov 2, 2025, World record <= 3.28 val loss on _the first 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
+
+## Updates
+- While I haven't had much time to play around with this repo lately, I have added 2 new versions, improving this repo's best time to X, now also on the same 10M tokens the official speedrun uses.
+- In this time, the official speedrun [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) has improved another 30% in 2 months and are already at 1.540 minutes (Feb 9th, 2026). Go check them out!
 
 ### WR vs This Repo Differences
 
