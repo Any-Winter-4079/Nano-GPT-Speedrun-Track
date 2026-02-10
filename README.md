@@ -17,35 +17,13 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 
 - As some noticeable differences, this repo tries to have more comments and be more customizable (possibly better for: learning, adaptation to other use cases) while the world record code is (a lot) more optimized.
 
-## Configuration Options
+## Results
 
-This repo supports toggling between the following config options:
+### Train/val loss
 
-- FlashAttention / FlexAttention
-- SWA (Sliding Window Attention) and SWA window ramp, doc masking, and attention logit soft-capping (if FlexAttention, for performance)
-- Custom masking (e.g., padding mask if non-causal)
-- AdamW or AdamW and Muon
-- MHA/MQA/GQA (n_heads vs n_kv_heads)
-- QK norm (RMS/L2)
-- RMSNorm or LayerNorm
-- GELU, ReLU, ReLU\*\*2, SiLU or SwiGLU (fair or unfair) activations
-- Bias or no bias
-- Tied or untied embeddings
-- Learning rate warmup and decay
-- RoPE/NoPE/absolute positional encodings
-- LM head logit soft-capping
-- Gradient norm clipping
-- Kernel warmup steps
-- ...
+### GPU benchmarking (Runpod)
 
-## Supports
-
-- Pre-training (stops at val_target)
-- Validation (shuffle or always use the same tokens as per speedrun record)
-- Sampling (increasingly longer sequences as the model learns)
-- Evaluation (HellaSwag one-shot or standard -NOTE: one-shot may require bigger models than 114-124M to work)
-- Checkpointing (store checkpoint, resume from checkpoint)
-- Logging (to stdout and to file)
+<img width="1000" alt="gpt-cuda-gpu-speed-cost-plot" src="https://github.com/user-attachments/assets/a219faf3-b835-446b-a8b7-c7e435c47609" />
 
 ## Possible improvements
 
