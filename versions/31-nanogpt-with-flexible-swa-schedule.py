@@ -23,7 +23,7 @@ from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_
 from typing import Optional, Tuple, List, Dict, Any, Callable, Iterable, Sequence, Union
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 31-gpt-3-small-with-flexible-swa-schedule.py
+# torchrun --standalone --nproc_per_node=4 31-nanogpt-with-flexible-swa-schedule.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -170,7 +170,7 @@ class TrainingConfig:
     # derived from the above
     timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S") if not resume_from_checkpoint else resume_timestamp
     checkpoint_dir: str = f"./checkpoints/{timestamp}"
-    hub_repo_id: str = f"{hf_user}/gpt-3-small_{timestamp}"
+    hub_repo_id: str = f"{hf_user}/nanogpt_{timestamp}"
 
     # logging (derived from the above)
     config_and_log_dir: str = f"./configs_and_logs/{timestamp}"

@@ -20,7 +20,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 26-gpt-3-small-with-or-without-doc-masking-swa-and-attn-logit-soft-capping.py
+# torchrun --standalone --nproc_per_node=4 26-nanogpt-with-or-without-doc-masking-swa-and-attn-logit-soft-capping.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -1907,7 +1907,7 @@ if master_process:
 
 hf_user = os.environ.get("hf_user")
 hf_token = os.environ.get("hf_token")
-hub_repo_id = f"{hf_user}/gpt-3-small_{timestamp}"
+hub_repo_id = f"{hf_user}/nanogpt_{timestamp}"
 
 start_step = 0
 train_tokens_processed = 0

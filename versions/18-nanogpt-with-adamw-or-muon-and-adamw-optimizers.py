@@ -17,7 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 18-gpt-3-small-with-adamw-or-muon-and-adamw-optimizers.py
+# torchrun --standalone --nproc_per_node=4 18-nanogpt-with-adamw-or-muon-and-adamw-optimizers.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -1506,7 +1506,7 @@ if master_process:
 
 hf_user = os.environ.get("hf_user")
 hf_token = os.environ.get("hf_token")
-hub_repo_id = f"{hf_user}/gpt-3-small_{timestamp}"
+hub_repo_id = f"{hf_user}/nanogpt_{timestamp}"
 
 start_step = 0
 train_tokens_processed = 0

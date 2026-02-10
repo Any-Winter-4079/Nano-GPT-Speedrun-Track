@@ -14,7 +14,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 # pip install tiktoken
 
-# torchrun --standalone --nproc_per_node=2 10-gpt-3-small-with-val.py
+# torchrun --standalone --nproc_per_node=2 10-nanogpt-with-val.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ###############################################

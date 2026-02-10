@@ -18,7 +18,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 25-gpt-3-small-with-longer-sequence-length.py
+# torchrun --standalone --nproc_per_node=4 25-nanogpt-with-longer-sequence-length.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -1443,7 +1443,7 @@ def save_config_info():
         f.write(f"seq len (val): {seq_len_val}\n")
         f.write(f"total tokens per mini-step (train): {total_tokens_per_mini_step_train}\n")
         f.write(f"grad accum mini-steps: {grad_accum_mini_steps}\n")
-        f.write(f"total tokens per mini-step (val): {total_tokens_per_mini_step_val}\n")
+        f.write(f"total tokens per step (val): {total_tokens_per_step_val}\n")
         
         f.write(f"betas: {betas}\n")
         f.write(f"eps: {eps}\n")
@@ -1671,9 +1671,9 @@ val_target = 3.28
 val_tokens = 2 ** 21 * 5
 val_steps = math.ceil(val_tokens / (ddp_world_size * gpu_batch_size_val * seq_len_val))
 val_interval = 50
-total_tokens_per_mini_step_val = ddp_world_size * gpu_batch_size_val * seq_len_val
+total_tokens_per_step_val = ddp_world_size * gpu_batch_size_val * seq_len_val
 if master_process:
-    print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_mini_step_val:,} tokens per val step)")
+    print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_step_val:,} tokens per val step)")
 # to save compute, start running validation when training loss + train_val_margin <= val_target
 train_val_margin = 0.03
 allow_val = False
@@ -1715,7 +1715,7 @@ if master_process:
 
 hf_user = os.environ.get("hf_user")
 hf_token = os.environ.get("hf_token")
-hub_repo_id = f"{hf_user}/gpt-3-small_{timestamp}"
+hub_repo_id = f"{hf_user}/nanogpt_{timestamp}"
 
 start_step = 0
 train_tokens_processed = 0

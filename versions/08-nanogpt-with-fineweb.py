@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-# torchrun --standalone --nproc_per_node=8 8-gpt-3-small-with-fineweb.py
+# torchrun --standalone --nproc_per_node=8 8-nanogpt-with-fineweb.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ##################################################

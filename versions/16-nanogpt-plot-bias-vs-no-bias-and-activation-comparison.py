@@ -8,7 +8,7 @@ from huggingface_hub import hf_hub_download
 
 bin_width = 1000
 val_interval = 100
-repo_base_name = "gpt-3-small_"
+repo_base_name = "nanogpt_"
 
 timestamps_all = [
     "20250803_164625",
