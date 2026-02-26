@@ -1426,6 +1426,7 @@ ddp_world_size = int(os.environ['WORLD_SIZE'])
 device_type = "cuda"
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
+# in torch 2.10 cuda 12.8,you can get rid of the warning with
 # init_process_group(backend='nccl', device_id=ddp_local_rank)
 init_process_group(backend='nccl')
 master_process = ddp_rank == 0
