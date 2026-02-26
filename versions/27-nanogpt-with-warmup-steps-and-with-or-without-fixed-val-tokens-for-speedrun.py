@@ -21,7 +21,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 27-nanogpt-with-warmup-steps-and-with-or-without-fixed-val-tokens-for-speedrun.py
+# torchrun --standalone --nproc_per_node=4 versions/27-nanogpt-with-warmup-steps-and-with-or-without-fixed-val-tokens-for-speedrun.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -260,14 +260,14 @@ def apply_rotation(q, k, cos, sin):
 #   build an SGD+momentum update g, then REPLACE it with its nearest orthogonal
 #   matrix (orthogonalization), and apply that as the step. This helps keep layers
 #   well-conditioned and discourages rank collapse.
- # ---------
+# ---------
 # Muon vs AdamW:
 #   Muon uses SGD + momentum to form g, then orthogonalizes g (via the backend) and scales it.
 #   Use Muon for 2D block weights (e.g., transformer.h.*.weight).
 #   Keep embeddings, layer norms, biases, and the final lm_head on AdamW.
 #   Train these disjoint  param sets with their respective optimizers in parallel.
 #   To use it with 4D convolutional filters, flatten the last 3 dimensions.
- # ---------
+# ---------
 # The backend is simply the algorithm used to orthogonalize the 2D update matrix. Two choices are:
 #   svd:
 #       Exact, via SVD. If G = U S V^T, the projection of G (in Frobenius norm) onto the Stiefel
@@ -1153,7 +1153,8 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
                 # and predict, resulting in (len(sample_sequences), seq_len, vocab_size)
                 # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
                 # so we can skip passing an attn_mask
-                logits, _ = raw_gpt_model(generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
+                eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+                logits, _ = eager_gpt_model(generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
             
             # of which we take the vocab_size values for each sequence's continuation to the last non-pad token,
             # resulting in len(sample_sequences), vocab_size
@@ -1819,12 +1820,14 @@ def load_checkpoint():
 ################################################
 #      Initialization & Non-Model Config       #
 ################################################
-init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
+device_type = "cuda"
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
+# init_process_group(backend='nccl', device_id=ddp_local_rank)
+init_process_group(backend='nccl')
 master_process = ddp_rank == 0
 
 # buffer to 'write to disk' only at checkpointing steps, to avoid e.g. stopping training at step 233,
@@ -1871,8 +1874,6 @@ if master_process:
     for message in messages:
         print(message)
         log_buffer.append(message)
-
-device_type = "cuda"
 
 torch.set_float32_matmul_precision('high')
 
@@ -2100,6 +2101,11 @@ if master_process:
 #                Kernel Warmup                 #
 ################################################
 def _kernel_warmup(num_train_steps=2):
+    do_train_warmup = os.environ.get("WARMUP_TRAIN", "1") == "1"
+    do_val_warmup = os.environ.get("WARMUP_VAL", "1") == "1"
+    do_sample_warmup = os.environ.get("WARMUP_SAMPLE", "1") == "1"
+    do_hellaswag_warmup = os.environ.get("WARMUP_HELLASWAG", "1") == "1"
+
     # snapshot everything so we don't "cheat"
     model_state = copy.deepcopy(raw_gpt_model.state_dict())
     optimizer_states = {k: copy.deepcopy(opt.state_dict()) for k, opt in optimizers.items()}
@@ -2111,132 +2117,145 @@ def _kernel_warmup(num_train_steps=2):
         dist.barrier()
 
     # train-shape warmup (compile both DDP graphs)
-    gpt_model.train()
-    with torch.enable_grad():
-        for _ in range(num_train_steps):
-            for optimizer in optimizers.values():
-                optimizer.zero_grad(set_to_none=True)
+    if do_train_warmup:
+        if master_process:
+            print("kernel warmup: train")
+        gpt_model.train()
+        with torch.enable_grad():
+            for _ in range(num_train_steps):
+                for optimizer in optimizers.values():
+                    optimizer.zero_grad(set_to_none=True)
 
-            for mini_step in range(grad_accum_mini_steps):
-                # mimic the real training loop’s DDP behavior
-                gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
+                for mini_step in range(grad_accum_mini_steps):
+                    # mimic the real training loop’s DDP behavior
+                    gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
 
-                # make shapes match training
-                x_train = torch.randint(
-                    0, raw_gpt_model.pad_token_id,
-                    (gpu_batch_size_train, seq_len_train), device=device
-                )
-                y_train = torch.randint(
-                    0, raw_gpt_model.pad_token_id,
-                    (gpu_batch_size_train, seq_len_train), device=device
-                )
+                    # make shapes match training
+                    x_train = torch.randint(
+                        0, raw_gpt_model.pad_token_id,
+                        (gpu_batch_size_train, seq_len_train), device=device
+                    )
+                    y_train = torch.randint(
+                        0, raw_gpt_model.pad_token_id,
+                        (gpu_batch_size_train, seq_len_train), device=device
+                    )
 
-                # synthesize doc_ids so the doc-masking + SWA FlexAttention path compiles
-                if raw_gpt_model.use_doc_masking:
-                    # set random-ish EOS boundaries
-                    step = max(16, seq_len_train // 8)
-                    idxs = torch.arange(seq_len_train, device=device)[None, :]
-                    rand_offsets = torch.randint(0, step, (gpu_batch_size_train, 1), device=device)
-                    is_eos = ((idxs + rand_offsets) % step == 0)
-                    doc_ids_train = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
-                else:
-                    doc_ids_train = None
+                    # synthesize doc_ids so the doc-masking + SWA FlexAttention path compiles
+                    if raw_gpt_model.use_doc_masking:
+                        # set random-ish EOS boundaries
+                        step = max(16, seq_len_train // 8)
+                        idxs = torch.arange(seq_len_train, device=device)[None, :]
+                        rand_offsets = torch.randint(0, step, (gpu_batch_size_train, 1), device=device)
+                        is_eos = ((idxs + rand_offsets) % step == 0)
+                        doc_ids_train = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
+                    else:
+                        doc_ids_train = None
 
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    _, warm_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        _, warm_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
 
-                (warm_loss / grad_accum_mini_steps).backward()
+                    (warm_loss / grad_accum_mini_steps).backward()
 
-            for optimizer in optimizers.values():
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                for optimizer in optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
     torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
 
     # val-shape warmup (compile eval forward)
-    gpt_model.eval()
-    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        x_val = torch.randint(
-            0, raw_gpt_model.pad_token_id,
-            (gpu_batch_size_val, seq_len_val), device=device
-        )
-        y_val = torch.randint(
-            0, raw_gpt_model.pad_token_id,
-            (gpu_batch_size_val, seq_len_val), device=device
-        )
-        if raw_gpt_model.use_doc_masking:
-            step = max(16, seq_len_val // 8)
-            idxs = torch.arange(seq_len_val, device=device)[None, :]
-            rand_offsets = torch.randint(0, step, (gpu_batch_size_val, 1), device=device)
-            is_eos = ((idxs + rand_offsets) % step == 0)
-            doc_ids_val = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
-        else:
-            doc_ids_val = None
+    if do_val_warmup:
+        if master_process:
+            print("kernel warmup: val")
+        gpt_model.eval()
+        with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            x_val = torch.randint(
+                0, raw_gpt_model.pad_token_id,
+                (gpu_batch_size_val, seq_len_val), device=device
+            )
+            y_val = torch.randint(
+                0, raw_gpt_model.pad_token_id,
+                (gpu_batch_size_val, seq_len_val), device=device
+            )
+            if raw_gpt_model.use_doc_masking:
+                step = max(16, seq_len_val // 8)
+                idxs = torch.arange(seq_len_val, device=device)[None, :]
+                rand_offsets = torch.randint(0, step, (gpu_batch_size_val, 1), device=device)
+                is_eos = ((idxs + rand_offsets) % step == 0)
+                doc_ids_val = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
+            else:
+                doc_ids_val = None
 
-        _ = gpt_model(x_val, y_val, document_ids=doc_ids_val)
+            _ = gpt_model(x_val, y_val, document_ids=doc_ids_val)
 
     torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
 
     # sampling-shape warmup
-    raw_gpt_model.eval()
-    max_new_tokens = get_sample_token_count(start_step)
-    max_allowed_input_len = raw_gpt_model.max_seq_len - max_new_tokens
-    initial_input_ids_list = [
-        tokenizer.encode(sequence)[:max_allowed_input_len] 
-        for sequence in sample_sequences
-    ]
-    max_input_len = max(1, max(len(ids) for ids in initial_input_ids_list))
-    alloc_len = max_input_len + max_new_tokens
-    round_multiple = 128 if raw_gpt_model.use_flex_attention else 8
-    alloc_len = min(raw_gpt_model.max_seq_len, math.ceil(alloc_len / round_multiple) * round_multiple)
+    if do_sample_warmup:
+        if master_process:
+            print("kernel warmup: sample")
+        raw_gpt_model.eval()
+        max_new_tokens = get_sample_token_count(start_step)
+        max_allowed_input_len = raw_gpt_model.max_seq_len - max_new_tokens
+        initial_input_ids_list = [
+            tokenizer.encode(sequence)[:max_allowed_input_len] 
+            for sequence in sample_sequences
+        ]
+        max_input_len = max(1, max(len(ids) for ids in initial_input_ids_list))
+        alloc_len = max_input_len + max_new_tokens
+        round_multiple = 128 if raw_gpt_model.use_flex_attention else 8
+        alloc_len = min(raw_gpt_model.max_seq_len, math.ceil(alloc_len / round_multiple) * round_multiple)
 
-    sampling_input_ids = torch.full(
-        (len(sample_sequences), alloc_len),
-        raw_gpt_model.pad_token_id,
-        dtype=torch.long,
-        device=device
-    )
-    for i, ids in enumerate(initial_input_ids_list):
-        if ids:
-            sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-
-    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        _ = raw_gpt_model(
-            sampling_input_ids,
-            attn_mask=None,
-            ignore_doc_mask=True,
-            document_ids=None,
+        sampling_input_ids = torch.full(
+            (len(sample_sequences), alloc_len),
+            raw_gpt_model.pad_token_id,
+            dtype=torch.long,
+            device=device
         )
+        for i, ids in enumerate(initial_input_ids_list):
+            if ids:
+                sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+        with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+            _ = eager_gpt_model(
+                sampling_input_ids,
+                attn_mask=None,
+                ignore_doc_mask=True,
+                document_ids=None,
+            )
 
     torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
 
     # hellaswag-shape warmup
-    raw_gpt_model.eval()
-    hellaswag_examples_per_batch = 16
-    max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
+    if do_hellaswag_warmup:
+        if master_process:
+            print("kernel warmup: hellaswag")
+        raw_gpt_model.eval()
+        hellaswag_examples_per_batch = 16
+        max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
 
-    alloc_len = min(1024, raw_gpt_model.max_seq_len)
+        alloc_len = min(1024, raw_gpt_model.max_seq_len)
 
-    pre_allocated_input_ids = torch.full(
-        (max_gpu_sequences_per_batch, alloc_len),
-        raw_gpt_model.pad_token_id,
-        dtype=torch.long,
-        device=device
-    )
-
-    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        _ = raw_gpt_model(
-            pre_allocated_input_ids,
-            attn_mask=None,
-            ignore_doc_mask=True,
-            document_ids=None,
+        pre_allocated_input_ids = torch.full(
+            (max_gpu_sequences_per_batch, alloc_len),
+            raw_gpt_model.pad_token_id,
+            dtype=torch.long,
+            device=device
         )
+
+        with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            _ = raw_gpt_model(
+                pre_allocated_input_ids,
+                attn_mask=None,
+                ignore_doc_mask=True,
+                document_ids=None,
+            )
 
     torch.cuda.synchronize()
     if dist.is_initialized():

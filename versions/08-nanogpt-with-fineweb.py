@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-# torchrun --standalone --nproc_per_node=8 8-nanogpt-with-fineweb.py
+# torchrun --standalone --nproc_per_node=8 versions/8-nanogpt-with-fineweb.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ##################################################
@@ -262,12 +262,14 @@ def get_lr(step):
         coeff = 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (warmup_and_cosine_steps - warmup_steps)))
         return min_lr_after_warmup + coeff * (max_lr - min_lr_after_warmup)
 
-init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
+device_type = "cuda"
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
+# init_process_group(backend='nccl', device_id=ddp_local_rank)
+init_process_group(backend='nccl')
 master_process = ddp_rank == 0
 
 total_tokens_per_step = 2**19
@@ -300,8 +302,6 @@ if master_process:
 seed = 1337 + ddp_rank
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
-
-device_type = "cuda"
 
 torch.set_float32_matmul_precision('high')
 

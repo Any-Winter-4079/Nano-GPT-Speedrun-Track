@@ -1,26 +1,32 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import copy
 import math
 import time
 import torch
+import triton
 import inspect
 import tiktoken
 import threading
 import numpy as np
 import torch.nn as nn
+from torch import Tensor
+import triton.language as tl
 from datetime import datetime
 import torch.distributed as dist
 from datasets import load_dataset
-from dataclasses import dataclass
+from tiktoken.core import Encoding
 from torch.nn import functional as F
 from huggingface_hub import hf_hub_download
+from dataclasses import field, fields, dataclass
 from safetensors.torch import save_model, load_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask, and_masks
+from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_block_mask, and_masks
+from typing import Optional, Tuple, List, Dict, Any, Callable, Iterable, Sequence, Union
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 versions/26-nanogpt-with-or-without-doc-masking-swa-and-attn-logit-soft-capping.py
+# torchrun --standalone --nproc_per_node=4 versions/32-nanogpt-with-or-without-polar-express.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -32,9 +38,21 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask,
 ################################################
 @dataclass
 class GPTConfig:
-    max_seq_len: int = 1024 # overwritten by max(seq_len_train, seq_len_val)
+    # miscellaneous
+    n_layers: int = 8
+    d_model: int = 1024
+    use_bias: bool = False
+    up_proj_factor: int = 2
+    use_tied_embeddings: bool = True
+    norm_type: str = "rms" # "rms" or any other name for "layer"
+    is_causal: bool = True # True for decoders or False for encoders - NOTE: affects sliding_window_max_size! -
+
+    # vocabulary and tokenizer
     vocab_size: int = 50304
-    n_layers: int = 12
+    pad_token_id: int = 50257
+    eos_token_id: int = 50256
+    
+    # attention
     # n_heads == n_kv_heads    for MHA (Multi-Head Attention)
     # n_heads > n_kv_heads > 1 for GQA (Grouped-Query Attention) 
     # and n_kv_heads == 1      for MQA  (Multi-Query Attention)
@@ -42,35 +60,35 @@ class GPTConfig:
     # q_proj: (d_model → n_heads * head_size)
     # k_proj: (d_model → n_kv_heads * head_size)
     # when d_model is split, the more (q) heads, the smaller the head_size, which is reused for k, v
-    n_heads: int = 12
-    n_kv_heads: int = 4
-    d_model: int = 768
-    up_proj_factor: int = 4
-    use_tied_embeddings: bool = True
-    pad_token_id: int = 50257
-    eos_token_id: int = 50256
-    norm_type: str = "rms" # "rms" or any other name for "layer"
-    use_bias: bool = False
+    n_heads: int = 16
+    n_kv_heads: int = 16
+    use_flex_attention: bool = True # True for FlexAttention or False for SDPA
+    flex_block_size: int = 128
+    # NOTE: for performance reasons, SWA, attention logit soft capping and doc masking require FlexAttention
+    use_doc_masking: bool = False
+    use_sliding_window_attention: bool = True # True for Sliding Window (local) Attention (e.g., Mistral-style)
+    use_sliding_window_size_ramp: bool = True # True to ramp SWA window size up or False for fixed window size
+    # window size defines the number of most-recent keys a query can attend to (only used if use_sliding_window_attention=True)
+    sliding_window_min_size: int = 128 # sliding window size at the start of training (only used if use_sliding_window_size_ramp=True)
+    sliding_window_max_size: int = 2048 # constant window size (if use_sliding_window_size_ramp=False), or final window size (if use_sliding_window_size_ramp=True)
+    enforce_even_blocks: bool = False # this *can* increase the window past its max to fit even block count
+    # ramp can start and end at steps different than 0 and final step
+    swa_ramp_start_step: int = 200
+    swa_ramp_end_step: int = 10000
+    # window_size = window_size + (m * window_size) + (n * flex_block_size) allows to update:
+    # by additive increments if m=0 and n>0 (e.g., 128, 256, 384, etc., always adding 128 if m=0, n=1)
+    # (exponentially) by larger updates as steps increase if m>0 (e.g., 128, 256, 512, etc., always multiplying by 2 if m=1, n=0)
+    swa_window_coeff_m: float = 0.0
+    swa_window_coeff_n: int = 1
+    # next_update_step = next_update_step + (m * next_update_step) + (n * 1 step) allows to update:
+    # by additive increments if m=0 and n>0 (e.g., 100, 200, 300, etc., adding 100 if n=100)
+    # (exponentially) by larger updates as steps increase if m>0 (e.g., 100, 200, 400, etc., always multiplying by 2 if m=1, n=0)
+    swa_step_coeff_m: float = 0.0
+    swa_step_coeff_n: int = 200
 
-    pos_encoding_type: str = "rope" # "rope", "nope", or any other name for "absolute"
-    rope_base_theta: int = 500_000
-
-    activation: str = "swiglu" # "gelu", "relu", "relu2" (relu^2), "silu" or "swiglu"
-    use_fair_swiglu: bool = True # only if swiglu
-
-    optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
-    # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
-    muon_lr_scale: float = 0.15
-    muon_backend: str = 'newtonschulz5'
-    # try 5–10; 8–10 for slightly “tighter” orthogonalization (slower)
-    muon_backend_steps: int = 8
-    muon_momentum: float = 0.95
-    use_nesterov: bool = True
-
-    # <-- Uncomment for gradient norm clipping -->
-    # use_grad_norm_clipping: bool = False
-    # gradient_clipping_norm: float = 1.0
-    # <-- Uncomment for gradient norm clipping -->
+    use_attn_logit_softcapping: bool = False # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
+    attn_logit_softcap: float = 15.0
+    tanh_backend: str = "ptx" # "clamp", "ptx" (faster) or "rational" or "exact"
 
     use_qk_norm: bool = True
     qk_norm_type: str = "rms" # "rms" or any other name for "l2"
@@ -79,21 +97,143 @@ class GPTConfig:
     qk_eps: float = 1e-6
     use_qk_debug_log: bool = True
 
+    # positional encodings/embeddings
+    pos_encoding_type: str = "rope" # "rope", "nope", or any other name for "absolute"
+    rope_base_theta: int = 500_000
+
+    # MLP activations
+    activation: str = "relu2" # "gelu", "relu", "relu2" (relu^2), "silu" or "swiglu"
+    use_fair_swiglu: bool = True # only if swiglu
+
+    # lm head logit soft-capping
     # <-- Uncomment for logit soft-capping -->
     # use_lm_head_logit_softcapping: bool = True
     # lm_head_logit_softcap: float = 20.0
     # <-- Uncomment for logit soft-capping -->
 
-    is_causal: bool = True # True for decoders or False for encoders - NOTE: affects sliding_window_size! -
-    use_flex_attention: bool = True # True for FlexAttention or False for SDPA
-    # NOTE: for performance reasons, SWA, attention logit soft capping and doc masking require FlexAttention
-    # While is_causal, RoPE and sampling are supported by both (SDPA and FlexAttention) branches
-    use_doc_masking: bool = True
-    use_sliding_window_attention: bool = True # True for Sliding Window (local) Attention (e.g., Mistral-style)
-    sliding_window_size: int = 1024 # number of most-recent tokens a query can attend to (only used if use_sliding_window_attention=True)
-    use_attn_logit_softcapping: bool = False # True for tanh soft-capping of attention logits (Gemma2/Grok-1 style), applied via score_mod before softmax
-    attn_logit_softcap: float = 15.0
-    tanh_backend: str = "ptx" # "clamp", "ptx" (faster) or "rational" or "exact"
+    # gradient norm clipping
+    # <-- Uncomment for gradient norm clipping -->
+    # use_grad_norm_clipping: bool = False
+    # gradient_clipping_norm: float = 1.0
+    # <-- Uncomment for gradient norm clipping -->
+
+@dataclass
+class TrainingConfig:
+    # steps and tokens
+    total_tokens_per_step_train: int = 2**18 # 2**19 == 524_288 or ~0.5M tokens from Language Models are Few-Shot Learners
+    # 32 * 2048 → 65_536 tokens
+    # up to 4 gpus →
+    #   65_536 * 1 → 65_536 tokens  → grad_accum_mini_steps = 4 (for 2**18 == 262_144 step tokens)
+    #   65_536 * 2 → 131_072 tokens → grad_accum_mini_steps = 2 (for 2**18 == 262_144 step tokens)
+    #   65_536 * 4 → 262_144 tokens → grad_accum_mini_steps = 1 (for 2**18 == 262_144 step tokens)
+    # for 8 gpus →
+    #   total_tokens_per_step needs to increase, or we need to reduce gpu batch size or seq len
+    gpu_batch_size_train: int = 8
+    gpu_batch_size_val: int = 8
+    seq_len_train: int = 8192
+    seq_len_val: int = 8192
+    max_tokens: int = 5 * 10**9
+    # derived from the above
+    max_seq_len: int = max(seq_len_train, seq_len_val)
+    max_train_steps: int = max_tokens // total_tokens_per_step_train
+
+    # tokenizer
+    tokenizer: Encoding = tiktoken.get_encoding("gpt2")
+
+    # optimizers
+    adamw_betas: Tuple[float, float] = (0.9, 0.95)
+    adamw_eps: float = 1e-8
+    adamw_max_lr: float = 5e-3
+    adamw_min_lr_after_lr_warmup_ratio: float = 0.15
+    lr_warmup_tokens: int = 0
+    lr_warmup_and_cosine_tokens: int = 600 * 10**6
+    adamw_weight_decay: float = 0.01
+    adamw_hard_min_lr: float = 7e-4
+    optimizer_type: str = "muon" # "muon" (and adamw) or any other name for "adamw"
+    muon_lr_scale: float = 0.15 # Muon usually likes a smaller LR than AdamW (e.g., 0.1x)
+    muon_backend: str = "newtonschulz5" # "svd" | "newtonschulz5" | "polarexpress"
+    muon_backend_steps: int = 5 # ~5-10; the higher, the slightly “tighter” orthogonalization (and slower)
+    muon_momentum: float = 0.95
+    muon_use_nesterov: bool = True
+    # derived from the above
+    adamw_min_lr_after_lr_warmup: float = adamw_min_lr_after_lr_warmup_ratio * adamw_max_lr
+    lr_warmup_steps: int = lr_warmup_tokens // total_tokens_per_step_train
+    lr_warmup_and_cosine_steps: int = lr_warmup_and_cosine_tokens // total_tokens_per_step_train
+    min_lr_after_warmup: float = adamw_min_lr_after_lr_warmup_ratio * adamw_max_lr
+
+    # loading/checkpointing
+    checkpoint_interval: int = 1000
+    max_checkpoints_to_keep: int = 0
+    resume_from_checkpoint: bool = False
+    resume_checkpoint_path: str = "model_step_0000125_val_6.8745_train_6.9019.safetensors"
+    resume_state_dict_path: str = "training_state_step_0000125.pt"
+    resume_timestamp: str = "20250801_085237"
+    hf_user: str = os.environ.get("hf_user")
+    hf_token: str = os.environ.get("hf_token")
+    # derived from the above
+    timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S") if not resume_from_checkpoint else resume_timestamp
+    checkpoint_dir: str = f"./checkpoints/{timestamp}"
+    hub_repo_id: str = f"{hf_user}/nanogpt_{timestamp}"
+
+    # logging (derived from the above)
+    config_and_log_dir: str = f"./configs_and_logs/{timestamp}"
+    log_filename: str = os.path.join(config_and_log_dir, f"log.txt")
+    config_filename: str = os.path.join(config_and_log_dir, f"config.txt")
+
+    # dataloader
+    data_path: str = "./data/edu_fineweb10B"
+
+    # validation
+    val_target: float = 3.28
+    val_tokens: int = 5 * 2**21 # 5 * 2**21 == 10_485_760
+    shuffle_val_tokens: bool = False # shuffle or first 10_485_760 tokens of the FineWeb validation shard for the NanoGPT Speedrun
+    val_interval: int = 50
+    train_val_margin: float = 0.11 # to save compute, start running validation when training loss + train_val_margin <= val_target
+
+    # sampling
+    sample_interval: int = 4000
+    sample_sequences: List[str] = field(default_factory=lambda:[
+        "The universe has always been",
+        "Who am I? I am a language model",
+        "Artificial General Intelligence is",
+        "Artificial General Intelligence is not",
+        "2+2 is",
+        "The quick brown fox jumps",
+        "Earth is",
+        "Could you tell me what time it is?",
+    ])
+
+    # hellaswag
+    hellaswag_interval: int = 4000
+
+    # seeding
+    base_seed: int = 1337
+
+    # kernel warmup
+    kernel_warmup_train_steps: int = 2
+
+    # filled by resolve(ddp_world_size)
+    # steps and tokens
+    total_tokens_per_mini_step_train: int = field(init=False)
+    grad_accum_mini_steps: int = field(init=False)
+    total_tokens_per_step_val: int = field(init=False)
+    val_steps: int = field(init=False)
+
+    def resolve(self, ddp_world_size: int) -> None:
+        # Muon Polar Express
+        if self.optimizer_type == "muon" and self.muon_backend == "polarexpress":
+            assert self.muon_backend_steps == 5, (
+                "Using Polar Express currently requires muon_backend_steps=5 steps due to "
+                f"pre-computed coefficients (got {self.muon_backend_steps} steps)"
+            )
+
+        # steps and tokens
+        self.total_tokens_per_mini_step_train = ddp_world_size * self.gpu_batch_size_train * self.seq_len_train
+        self.grad_accum_mini_steps = self.total_tokens_per_step_train // self.total_tokens_per_mini_step_train
+        assert self.total_tokens_per_step_train % self.total_tokens_per_mini_step_train == 0, \
+            "total_tokens_per_step must be a multiple of tokens per mini-step"
+        self.total_tokens_per_step_val = ddp_world_size * self.gpu_batch_size_val * self.seq_len_val
+        self.val_steps = math.ceil(self.val_tokens / self.total_tokens_per_step_val)
 
 ################################################
 #            Fast tanh Soft Capping            #
@@ -117,15 +257,15 @@ try:
 
     if not _ALREADY_REGISTERED:
         @torch.library.custom_op("approx::tanh", mutates_args=())
-        def _tanh_approx(inp: torch.Tensor) -> torch.Tensor:
+        def _tanh_approx(inp: Tensor) -> Tensor:
             # eager fallback path
             return torch.tanh(inp)
 
         @_tanh_approx.register_fake
-        def _(inp: torch.Tensor) -> torch.Tensor:
+        def _(inp: Tensor) -> Tensor:
             return torch.tanh(inp)
 
-        def _tanh_approx_lowering(inp):
+        def _tanh_approx_lowering(inp: Tensor) -> Tensor:
             # inline ptx (f32)
             fn = partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
             return make_pointwise(fn)(inp)
@@ -139,19 +279,19 @@ except Exception:
 
 class _TanhApproxFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x):
+    def forward(ctx: Any, x: Tensor) -> Tensor:
         # ptx op is f32; caller upcasts beforehand
         y = torch.ops.approx.tanh(x)
         ctx.save_for_backward(y)
         return y
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx: Any, grad_out: Tensor) -> Tensor:
         (y,) = ctx.saved_tensors
         # d/dx tanh(x) = 1 - tanh^2(x)
         return grad_out * (1 - y * y)
 
-def _tanh_ptx(x: torch.Tensor) -> torch.Tensor:
+def _tanh_ptx(x: Tensor) -> Tensor:
     # expects float32
     return _TanhApproxFn.apply(x)
 
@@ -203,7 +343,7 @@ def generate_tanh_softcap(soft_cap: float, backend: str):
 #                      RoPE                    #
 ################################################
 class Rotary(nn.Module):
-    def __init__(self, head_size, base_theta, max_seq_len):
+    def __init__(self, head_size: int, base_theta: int, max_seq_len: int) -> None:
         super().__init__()
         assert head_size % 2 == 0, "RoPE needs even head_size"
         # head_size/2,
@@ -223,14 +363,24 @@ class Rotary(nn.Module):
         self.register_buffer("cos_cached", cos, persistent=False)
         self.register_buffer("sin_cached", sin, persistent=False)
 
-    def get_cos_sin(self, seq_len, dtype, device):
+    def get_cos_sin(
+            self,
+            seq_len: int,
+            dtype: torch.dtype, 
+            device: Union[str, torch.device]
+            ) -> Tuple[Tensor, Tensor]:
         # slice to current length and cast on the fly to avoid
         # shape mutation of buffers
         cos = self.cos_cached[..., :seq_len, :].to(device=device, dtype=dtype)
         sin = self.sin_cached[..., :seq_len, :].to(device=device, dtype=dtype)
         return cos, sin
 
-def apply_rotation(q, k, cos, sin):
+def apply_rotation(
+        q: Tensor,
+        k: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        ) -> Tuple[Tensor, Tensor]:
     gpu_batch_size, n_heads, seq_len, head_size = q.shape
     _, n_kv_heads_k, _, _ = k.shape
 
@@ -252,6 +402,318 @@ def apply_rotation(q, k, cos, sin):
     return q, k
 
 ################################################
+#                  Polar Express               #
+################################################
+# -- Start of (modified) source: https://github.com/KellerJordan/modded-nanogpt/blob/df79a3265ebb121733499e035afed5b2ea420c95/train_gpt.py --
+# -- Implementing https://arxiv.org/pdf/2505.16932 (The Polar Express: Optimal Matrix Sign Methods and Their Application to the Muon Algorithm) --
+# Triton kernel for symmetric matrix multiplication by @byronxu99
+def _get_autotune_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": bn,
+                "BLOCK_SIZE_K": bk,
+                "GROUP_SIZE_M": 8,
+                "LOWER_UPPER": 1,
+            },
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm in [64, 128]
+        for bn in [64, 128, 256]
+        for bk in [64, 128]
+        for stages, warps in [(3, 4), (3, 8), (4, 4)]
+        if bm // bn <= 2 and bn // bm <= 2
+    ]
+
+@triton.jit
+def _pid_to_block(
+    pid,
+    M,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    # Split output matrix into blocks of size (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(M, BLOCK_SIZE_N)
+
+    # Map PID to a single matrix in batch
+    batch_idx = pid // (num_pid_m * num_pid_n)
+    pid = pid % (num_pid_m * num_pid_n)
+
+    # Map PID to 2D grid of blocks
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
+    m_idx = pid_m * BLOCK_SIZE_M
+    n_idx = pid_n * BLOCK_SIZE_N
+    return batch_idx, m_idx, n_idx
+
+@triton.autotune(
+    configs=_get_autotune_configs(),
+    key=["M", "K", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
+)
+@triton.jit
+def XXT_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, at, accumulator)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+def XXT(A: Tensor, out: Tensor):
+    """
+    Launch Triton kernel to compute C = A @ A.T
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == M, "Output matrix has incorrect shape"
+    assert out.size(-1) == M, "Output matrix has incorrect shape"
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    grid = lambda meta: (
+        batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
+    )
+    XXT_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+    )
+    return out
+
+@triton.autotune(
+    configs=_get_autotune_configs(),
+    key=["M", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
+)
+@triton.jit
+def ba_plus_cAA_kernel(
+    A_ptr, C_ptr,
+    M,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    alpha, beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A
+    # Performance is slightly slower than XXT_kernel, so we use two separate kernels
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
+        at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, at, accumulator)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    # Load block of A to add (corresponds to the current block of C)
+    offs_am = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_an = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    a_add_ptrs = A_ptr + (offs_am[:, None] * a_stride_r + offs_an[None, :] * a_stride_c)
+    a_add_mask = (offs_am[:, None] < M) & (offs_an[None, :] < M)
+    a_add = tl.load(a_add_ptrs, mask=a_add_mask, other=0.0).to(tl.float32)
+
+    # Apply alpha and beta
+    accumulator *= alpha
+    accumulator += a_add * beta
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+def ba_plus_cAA(A: Tensor, alpha: float, beta: float, out: Tensor):
+    """
+    Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert M == K, "Input matrix must be square"
+    assert out.size(-2) == M
+    assert out.size(-1) == M
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    grid = lambda meta: (
+        batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
+    )
+    ba_plus_cAA_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        alpha=alpha,
+        beta=beta,
+    )
+    return out
+
+# Computed for num_iters=5, safety_factor=2e-2, cushion=2
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+]
+
+@torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
+def zeropower_via_polar_express(G: Tensor, steps: int = 5, split_baddbmm: bool = False):
+    """
+    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+    by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+
+    'steps' argument for API compatibility but ignored because 
+    coefficients are fixed for exactly 5 iterations.
+    """
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+
+    # Allocate buffers
+    X = X.contiguous()
+    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+    B = torch.empty_like(A)
+    C = torch.empty_like(X)
+
+    # Select batched vs unbatched
+    if split_baddbmm:
+        BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+    else:
+        aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+    # Perform the iterations
+    for a, b, c in polar_express_coeffs:
+        XXT(X, out=A)  # A = X @ X.mT
+        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+
+        # Referencing X twice causes pytorch to make a defensive copy, 
+        # resulting in a cudaMemcpyAsync in baddbmm.
+        # For large matrices (i.e., the mlp weights), it's faster to split 
+        # the operation into two kernels to avoid this.
+        if split_baddbmm:
+            BX_matmul(B, X, out=C)  # C = B @ X  
+            C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+        else:
+            aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+
+        X, C = C, X  # Swap references to avoid unnecessary copies
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+# -- End of (modified) source: https://github.com/KellerJordan/modded-nanogpt/blob/df79a3265ebb121733499e035afed5b2ea420c95/train_gpt.py --
+
+################################################
 #                     Muon                     #
 ################################################
 # In Muon, the goal is:
@@ -267,7 +729,7 @@ def apply_rotation(q, k, cos, sin):
 #   Train these disjoint  param sets with their respective optimizers in parallel.
 #   To use it with 4D convolutional filters, flatten the last 3 dimensions.
 # ---------
-# The backend is simply the algorithm used to orthogonalize the 2D update matrix. Two choices are:
+# The backend is simply the algorithm used to orthogonalize the 2D update matrix. Three choices are:
 #   svd:
 #       Exact, via SVD. If G = U S V^T, the projection of G (in Frobenius norm) onto the Stiefel
 #       manifold (the set of all orthonormal k-frames, with a k-frame an ordered set of 
@@ -276,6 +738,8 @@ def apply_rotation(q, k, cos, sin):
 #   newtonschulz5:
 #       Fast, iterative approximation (GPU-friendly) using a quintic Newton-Schulz iteration.
 #       It avoids an SVD on every step, runs well in bfloat16, and plays nice with torch.compile.
+#   polarexpress:
+#       Polar Express sign method (fast iterative), fixed 5-step coefficients.
 # ---------
 # It is recommended to use Nesterov-style momentum in the internal SGD.
 # ---------
@@ -297,12 +761,12 @@ def apply_rotation(q, k, cos, sin):
 # -----------------------------------------------------------------------------
 # Muon optimizer
 # Reference: https://kellerjordan.github.io/posts/muon/
-def zeropower_via_svd(G, steps=None):
+def zeropower_via_svd(G: Tensor, steps: Optional[int] = None) -> Tensor:
     U, S, V = G.svd()
     return U @ V.T
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, muon_eps: float = 1e-7) -> Tensor:
     """
     In-place & buffer-reusing variant:
       - uses preallocated mm(out=...) to avoid new tensors each iter
@@ -316,7 +780,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     transposed = G.size(0) > G.size(1)
     X = G.T if transposed else G
     # scale so top singular value <= 1 (Frobenius norm upper-bounds spectral norm)
-    denom = X.norm() + eps
+    denom = X.norm() + muon_eps
     X = (X / denom).to(torch.bfloat16)
 
     m, n = X.shape  # m <= n
@@ -338,7 +802,11 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     X = X.T if transposed else X
     return X.to(G.dtype)
 
-zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+zeropower_backends = dict(
+    svd=zeropower_via_svd,
+    newtonschulz5=zeropower_via_newtonschulz5,
+    polarexpress=zeropower_via_polar_express,
+)
 
 class Muon(torch.optim.Optimizer):
     """
@@ -366,11 +834,19 @@ class Muon(torch.optim.Optimizer):
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
 
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+    def __init__(
+            self,
+            params: Iterable[nn.Parameter],
+            lr: float = 3e-4,
+            momentum: float = 0.95,
+            nesterov: bool = True,
+            backend: str = "newtonschulz5",
+            backend_steps: int = 5,
+            ) -> None:
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
-    def step(self):
+    def step(self) -> None:
         for group in self.param_groups:
             lr = group['lr']
             momentum = group['momentum']
@@ -399,9 +875,21 @@ class Muon(torch.optim.Optimizer):
 #                  DataLoader                  #
 ################################################
 class DataLoader:
-    def __init__(self, gpu_batch_size, seq_len, ddp_world_size, ddp_rank, data_folder, split="train", 
-                 epoch=0, current_shard_idx=0, grad_accum_mini_steps_per_shard_counter=0,
-                 pad_token_id=50257, eos_token_id=50256, return_document_ids=False):
+    def __init__(self,
+                 gpu_batch_size: int,
+                 seq_len: int,
+                 ddp_world_size: int,
+                 ddp_rank: int,
+                 data_folder: str,
+                 split: str = "train",
+                 epoch: int = 0,
+                 current_shard_idx: int = 0,
+                 grad_accum_mini_steps_per_shard_counter: int = 0,
+                 pad_token_id: int = 50257, 
+                 eos_token_id: int = 50256,
+                 return_document_ids: bool = False, 
+                 shuffle_val_tokens: bool = True,
+                 ) -> None:
         # batch size each gpu can fit in
         self.gpu_batch_size = gpu_batch_size
         # seq len for each gpu
@@ -415,6 +903,7 @@ class DataLoader:
         self.pad_token_id = pad_token_id
         self.eos_token_id = eos_token_id
         self.return_document_ids = return_document_ids
+        self.shuffle_val_tokens = shuffle_val_tokens
 
         shards = os.listdir(data_folder)
         shards = [shard for shard in shards if split in shard]
@@ -467,7 +956,7 @@ class DataLoader:
         self._next_tokens = None
         self._start_shard_prefetch()
     
-    def show_shard_info(self):
+    def show_shard_info(self) -> None:
         messages = [
             f"total {self.split} shard {self.current_shard_idx} tokens: {len(self.tokens):,}",
             f"total gpus: {self.ddp_world_size}",
@@ -480,12 +969,15 @@ class DataLoader:
             print(message)
             log_buffer.append(message)
     
-    def _shuffle_shard(self):
-        g = torch.Generator()
-        g.manual_seed(self.current_shard_idx + self.epoch)
-        # e.g., [0, 2048, 11264, 10240, 4096, 9216, 1024, 5120, 6144, 8192, 3072, 7168]
-        shuffled_indices = torch.randperm(len(self.x_seq_starts), generator=g).tolist()
-        self.x_seq_starts = [self.x_seq_starts[i] for i in shuffled_indices]
+    def _shuffle_shard(self) -> None:
+        if self.split == "train" or (self.split == "val" and self.shuffle_val_tokens):
+            g = torch.Generator()
+            g.manual_seed(self.current_shard_idx + self.epoch)
+            # e.g., [0, 2048, 11264, 10240, 4096, 9216, 1024, 5120, 6144, 8192, 3072, 7168]
+            shuffled_indices = torch.randperm(len(self.x_seq_starts), generator=g).tolist()
+            self.x_seq_starts = [self.x_seq_starts[i] for i in shuffled_indices]
+        # else: keep original order for validation (global prefix)
+
         # e.g., 12 * 0 / 2 = 0 for gpu0, 12 * 1 / 2 = 6 for gpu 1
         gpu_x_seq_start_idx = len(self.x_seq_starts) * self.ddp_global_rank // self.ddp_world_size
         # e.g., 0 + 12 / 2 = 6 for gpu0, 6 + 12 / 2 = 12 for gpu 1
@@ -494,7 +986,8 @@ class DataLoader:
         # [1024, 5120, 6144, 8192, 3072, 7168] for gpu 1
         self.gpu_x_seq_starts = self.x_seq_starts[gpu_x_seq_start_idx:gpu_x_seq_end_idx]
 
-    def _start_shard_prefetch(self):
+
+    def _start_shard_prefetch(self) -> None:
         # prefetch the next shard if not already running
         if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
             return
@@ -509,11 +1002,11 @@ class DataLoader:
         self._prefetch_thread = threading.Thread(target=_worker, daemon=True)
         self._prefetch_thread.start()
 
-    def load_shard_tokens(self, shard_path):
+    def load_shard_tokens(self, shard_path: str) -> Tensor:
         # materialize to CPU long tensor (stable, no memmap)
         return torch.tensor(np.load(shard_path).astype(np.int32), dtype=torch.long)
     
-    def reset(self):
+    def reset(self) -> None:
         self.current_shard_idx = 0
         self.grad_accum_mini_steps_per_shard_counter = 0
         self.tokens = self.load_shard_tokens(self.sorted_shards[self.current_shard_idx])
@@ -526,7 +1019,7 @@ class DataLoader:
         self._next_tokens = None
         self._start_shard_prefetch()
     
-    def next_batch(self):
+    def next_batch(self) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         if self.grad_accum_mini_steps_per_shard_counter == self.grad_accum_mini_steps_per_shard:
             self.current_shard_idx += 1
             self.grad_accum_mini_steps_per_shard_counter = 0
@@ -553,13 +1046,21 @@ class DataLoader:
             self._shuffle_shard()
             # immediately prefetch the following shard
             self._start_shard_prefetch()
-        # e.g., 0 for the 1st grad accum mini-step, gpu_batch_size for the 2nd grad accum mini-step, etc.
-        i = self.grad_accum_mini_steps_per_shard_counter * self.gpu_batch_size
-        # e.g., for gpu 0: [0, 2048] for the 1st grad accum mini-step, [11264, 10240] for the 2nd grad accum mini-step, etc.
-        #       for gpu 1: [1024, 5120] for the 1st grad accum mini-step, [6144, 8192] for the 2nd grad accum mini-step, etc.
-        batch_starts = self.gpu_x_seq_starts[i:i + self.gpu_batch_size]
-        # e.g., for gpu 0: [0-1023, 2048-3071] for the 1st grad accum mini-step
-        #       for gpu 1: [1024-2047, 5120-6143] for the 1st grad accum mini-step
+        
+        if (self.split == "val") and (not self.shuffle_val_tokens):
+            # global, ordered prefix partitioning across ranks
+            global_batch_start = self.grad_accum_mini_steps_per_shard_counter * self.ddp_world_size * self.gpu_batch_size
+            start = global_batch_start + self.ddp_global_rank * self.gpu_batch_size
+            batch_starts = self.x_seq_starts[start:start + self.gpu_batch_size]
+        else:
+            # e.g., 0 for the 1st grad accum mini-step, gpu_batch_size for the 2nd grad accum mini-step, etc.
+            i = self.grad_accum_mini_steps_per_shard_counter * self.gpu_batch_size
+            # e.g., for gpu 0: [0, 2048] for the 1st grad accum mini-step, [11264, 10240] for the 2nd grad accum mini-step, etc.
+            #       for gpu 1: [1024, 5120] for the 1st grad accum mini-step, [6144, 8192] for the 2nd grad accum mini-step, etc.
+            batch_starts = self.gpu_x_seq_starts[i:i + self.gpu_batch_size]
+            # e.g., for gpu 0: [0-1023, 2048-3071] for the 1st grad accum mini-step
+            #       for gpu 1: [1024-2047, 5120-6143] for the 1st grad accum mini-step
+
         x = torch.stack([self.tokens[start:start + self.seq_len] for start in batch_starts])
         y = torch.stack([self.tokens[start + 1:start + self.seq_len + 1] for start in batch_starts])
 
@@ -578,7 +1079,7 @@ class DataLoader:
 #                QK Norm Debug                 #
 ################################################
 @torch.no_grad()
-def qk_scale_debug_string(model):
+def qk_scale_debug_string(model: "GPT") -> str:
     max_q_raw = 0.0
     max_k_raw = 0.0
     max_q_eff = 0.0
@@ -612,28 +1113,28 @@ def qk_scale_debug_string(model):
 #                Self Attention                #
 ################################################
 class SelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig) -> None:
         super().__init__()
         
-        assert config.d_model % config.n_heads == 0
-        self.d_model = config.d_model
-        self.n_heads = config.n_heads
-        self.n_kv_heads = config.n_kv_heads
+        assert gpt_config.d_model % gpt_config.n_heads == 0
+        self.d_model = gpt_config.d_model
+        self.n_heads = gpt_config.n_heads
+        self.n_kv_heads = gpt_config.n_kv_heads
         assert 1 <= self.n_kv_heads <= self.n_heads, "n_kv_heads must be in [1, n_heads]"
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads for GQA/MQA"
-        self.head_size = config.d_model // config.n_heads
+        self.head_size = gpt_config.d_model // gpt_config.n_heads
         self.q_heads_per_kv_head = self.n_heads // self.n_kv_heads
-        self.q_proj = nn.Linear(config.d_model, self.n_heads * self.head_size, bias=config.use_bias)
-        self.k_proj = nn.Linear(config.d_model, self.n_kv_heads * self.head_size, bias=config.use_bias)
-        self.v_proj = nn.Linear(config.d_model, self.n_kv_heads * self.head_size, bias=config.use_bias)
-        self.c_proj = nn.Linear(config.d_model, config.d_model, bias=config.use_bias)
+        self.q_proj = nn.Linear(gpt_config.d_model, self.n_heads * self.head_size, bias=gpt_config.use_bias)
+        self.k_proj = nn.Linear(gpt_config.d_model, self.n_kv_heads * self.head_size, bias=gpt_config.use_bias)
+        self.v_proj = nn.Linear(gpt_config.d_model, self.n_kv_heads * self.head_size, bias=gpt_config.use_bias)
+        self.c_proj = nn.Linear(gpt_config.d_model, gpt_config.d_model, bias=gpt_config.use_bias)
         
-        self.rotary = Rotary(self.head_size, config.rope_base_theta, config.max_seq_len) if config.pos_encoding_type.lower() == "rope" else None
+        self.rotary = Rotary(self.head_size, gpt_config.rope_base_theta, training_config.max_seq_len) if gpt_config.pos_encoding_type.lower() == "rope" else None
         
-        self.use_qk_norm = config.use_qk_norm
-        self.qk_norm_type = config.qk_norm_type
-        self.qk_scale_max = config.qk_scale_max
-        self.qk_eps = config.qk_eps
+        self.use_qk_norm = gpt_config.use_qk_norm
+        self.qk_norm_type = gpt_config.qk_norm_type
+        self.qk_scale_max = gpt_config.qk_scale_max
+        self.qk_eps = gpt_config.qk_eps
         if self.use_qk_norm:
             # q_scale and k_scale are learned per-head scalars, like LayerNorm’s γ, that let 
             # the model adjust magnitude after normalization
@@ -662,26 +1163,23 @@ class SelfAttention(nn.Module):
             #   = sqrt(1/head_size) * sqrt(sum(q_i^2)) = 
             #   = sqrt(1/head_size) * L2 = 1/sqrt(head_size) * L2
             #   ---
-            self.q_scale = nn.Parameter(torch.full((1, self.n_heads, 1, 1), config.qk_scale_init))
-            self.k_scale = nn.Parameter(torch.full((1, self.n_kv_heads, 1, 1), config.qk_scale_init))
+            self.q_scale = nn.Parameter(torch.full((1, self.n_heads, 1, 1), gpt_config.qk_scale_init))
+            self.k_scale = nn.Parameter(torch.full((1, self.n_kv_heads, 1, 1), gpt_config.qk_scale_init))
             
-        self.is_causal = config.is_causal
-        self.use_flex_attention = config.use_flex_attention
-        self.use_doc_masking = config.use_doc_masking
-        self.use_sliding_window_attention = config.use_sliding_window_attention
-        self.sliding_window_size = config.sliding_window_size
-        self.use_attn_logit_softcapping = config.use_attn_logit_softcapping
-        self.attn_logit_softcap = config.attn_logit_softcap
+        self.is_causal = gpt_config.is_causal
+        self.use_flex_attention = gpt_config.use_flex_attention
+        self.use_attn_logit_softcapping = gpt_config.use_attn_logit_softcapping
+        self.attn_logit_softcap = gpt_config.attn_logit_softcap
 
-        if (self.use_doc_masking or self.use_sliding_window_attention or self.use_attn_logit_softcapping):
-            assert self.use_flex_attention, "Document masking / SWA / attention soft-capping require use_flex_attention=True"
-        if self.use_sliding_window_attention:
-            assert self.sliding_window_size > 0, "sliding_window_size must be > 0 with use_sliding_window_attention=True"
-
-        self.tanh_backend = config.tanh_backend
+        self.tanh_backend = gpt_config.tanh_backend
         self._score_mod = generate_tanh_softcap(self.attn_logit_softcap, backend=self.tanh_backend) if self.use_attn_logit_softcapping else None
 
-    def forward(self, x, flex_attn_block_mask=None, sdpa_attn_mask=None):
+    def forward(
+            self,
+            x: Tensor,
+            flex_attn_block_mask: Optional[BlockMask] = None,
+            sdpa_attn_mask: Optional[Tensor] = None,
+            ) -> Tensor:
         _, seq_len, d_model = x.size()
 
         q = self.q_proj(x).view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
@@ -751,9 +1249,9 @@ class SelfAttention(nn.Module):
 #                     MLP                      #
 ################################################
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, gpt_config: GPTConfig) -> None:
         super().__init__()
-        self.activation_name = config.activation.lower()
+        self.activation_name = gpt_config.activation.lower()
 
         if self.activation_name == "swiglu":
             # without gating:
@@ -770,15 +1268,15 @@ class MLP(nn.Module):
             # 1 down projection of size (2 / 3 * up_proj_factor * d_model, d_model) with -if used- d_model biases
             # the total number of weight parameters matches, but, if used, biases -slightly- differ as
             # up_proj_factor * d_model + d_model != 2 * 2 / 3 * up_proj_factor * d_model + d_model
-            self.hidden_dim = int(round((2.0/3.0) * config.up_proj_factor * config.d_model)) if config.use_fair_swiglu else config.up_proj_factor * config.d_model
-            self.c_fc = nn.Linear(config.d_model, self.hidden_dim * 2, bias=config.use_bias)
-            self.c_proj = nn.Linear(self.hidden_dim, config.d_model, bias=config.use_bias)
+            self.hidden_dim = round((2.0/3.0) * gpt_config.up_proj_factor * gpt_config.d_model) if gpt_config.use_fair_swiglu else gpt_config.up_proj_factor * gpt_config.d_model
+            self.c_fc = nn.Linear(gpt_config.d_model, self.hidden_dim * 2, bias=gpt_config.use_bias)
+            self.c_proj = nn.Linear(self.hidden_dim, gpt_config.d_model, bias=gpt_config.use_bias)
         else:
-            self.hidden_dim = config.up_proj_factor * config.d_model
-            self.c_fc = nn.Linear(config.d_model, self.hidden_dim, bias=config.use_bias)
-            self.c_proj = nn.Linear(self.hidden_dim, config.d_model, bias=config.use_bias)
+            self.hidden_dim = gpt_config.up_proj_factor * gpt_config.d_model
+            self.c_fc = nn.Linear(gpt_config.d_model, self.hidden_dim, bias=gpt_config.use_bias)
+            self.c_proj = nn.Linear(self.hidden_dim, gpt_config.d_model, bias=gpt_config.use_bias)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         # Gaussian Error Linear Unit
         if self.activation_name == "gelu":
             x = F.gelu(self.c_fc(x))
@@ -804,22 +1302,27 @@ class MLP(nn.Module):
 #                    Block                     #
 ################################################
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig) -> None:
         super().__init__()
-        self.residual_scale = (2 * config.n_layers) ** -0.5
+        self.residual_scale = (2 * gpt_config.n_layers) ** -0.5
 
-        if config.norm_type.lower() == "rms":
-            self.ln_1 = nn.RMSNorm(config.d_model)
+        if gpt_config.norm_type.lower() == "rms":
+            self.ln_1 = nn.RMSNorm(gpt_config.d_model)
         else:
-            self.ln_1 = nn.LayerNorm(config.d_model)
-        self.attn = SelfAttention(config)
-        if config.norm_type.lower() == "rms":
-            self.ln_2 = nn.RMSNorm(config.d_model)
+            self.ln_1 = nn.LayerNorm(gpt_config.d_model)
+        self.attn = SelfAttention(gpt_config, training_config)
+        if gpt_config.norm_type.lower() == "rms":
+            self.ln_2 = nn.RMSNorm(gpt_config.d_model)
         else:
-            self.ln_2 = nn.LayerNorm(config.d_model)
-        self.mlp = MLP(config)
+            self.ln_2 = nn.LayerNorm(gpt_config.d_model)
+        self.mlp = MLP(gpt_config)
 
-    def forward(self, x, flex_attn_block_mask=None, sdpa_attn_mask=None):
+    def forward(
+            self,
+            x: Tensor,
+            flex_attn_block_mask: Optional[BlockMask] = None,
+            sdpa_attn_mask: Optional[Tensor] = None,
+            ) -> Tensor:
         x = x + self.residual_scale * self.attn(self.ln_1(x), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
         x = x + self.residual_scale * self.mlp(self.ln_2(x))
         return x
@@ -828,57 +1331,97 @@ class Block(nn.Module):
 #                     GPT                      #
 ################################################
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig) -> None:
         super().__init__()
-        self.max_seq_len = config.max_seq_len
-        self.pad_token_id = config.pad_token_id
-        self.pos_encoding_type = config.pos_encoding_type.lower()
-        self.optimizer_type = config.optimizer_type.lower()
-        self.muon_lr_scale = config.muon_lr_scale
-        self.muon_backend = config.muon_backend
-        self.muon_backend_steps = config.muon_backend_steps
-        self.muon_momentum = config.muon_momentum
-        self.use_nesterov = config.use_nesterov
+        self.max_seq_len = training_config.max_seq_len
+        self.pad_token_id = gpt_config.pad_token_id
+        self.pos_encoding_type = gpt_config.pos_encoding_type.lower()
+        self.optimizer_type = training_config.optimizer_type.lower()
+
+        self.muon_lr_scale = training_config.muon_lr_scale
+        self.muon_backend = training_config.muon_backend
+        self.muon_backend_steps = training_config.muon_backend_steps
+        self.muon_momentum = training_config.muon_momentum
+        self.muon_use_nesterov = training_config.muon_use_nesterov
+
         # <-- Uncomment for gradient norm clipping -->
-        # self.use_grad_norm_clipping = config.use_grad_norm_clipping
-        # self.gradient_clipping_norm = config.gradient_clipping_norm
+        # self.use_grad_norm_clipping = gpt_config.use_grad_norm_clipping
+        # self.gradient_clipping_norm = gpt_config.gradient_clipping_norm
         # <-- Uncomment for gradient norm clipping -->
-        self.use_qk_norm = config.use_qk_norm
-        self.use_qk_debug_log = config.use_qk_debug_log
+
+        self.use_qk_norm = gpt_config.use_qk_norm
+        self.use_qk_debug_log = gpt_config.use_qk_debug_log
+
         # <-- Uncomment for logit soft-capping -->
-        # self.use_lm_head_logit_softcapping = config.use_lm_head_logit_softcapping
-        # self.lm_head_logit_softcap = config.lm_head_logit_softcap
+        # self.use_lm_head_logit_softcapping = gpt_config.use_lm_head_logit_softcapping
+        # self.lm_head_logit_softcap = gpt_config.lm_head_logit_softcap
         # self._logits_absmax_stats = None
         # <-- Uncomment for logit soft-capping -->
-        self.is_causal = config.is_causal
-        self.use_flex_attention = config.use_flex_attention
-        self.use_doc_masking = config.use_doc_masking
-        self.use_sliding_window_attention = config.use_sliding_window_attention
-        self.sliding_window_size = config.sliding_window_size
-        self.use_attn_logit_softcapping = config.use_attn_logit_softcapping
-        self.attn_logit_softcap = config.attn_logit_softcap
+
+        self.is_causal = gpt_config.is_causal
+
+        self.use_flex_attention = gpt_config.use_flex_attention
+        self.flex_block_size = gpt_config.flex_block_size
+
+        self.use_doc_masking = gpt_config.use_doc_masking
+
+        self.use_attn_logit_softcapping = gpt_config.use_attn_logit_softcapping
+        self.attn_logit_softcap = gpt_config.attn_logit_softcap
+
+        self.use_sliding_window_attention = gpt_config.use_sliding_window_attention
+        self.use_sliding_window_size_ramp = gpt_config.use_sliding_window_size_ramp
+        self.sliding_window_min_size = gpt_config.sliding_window_min_size
+        self.sliding_window_max_size = gpt_config.sliding_window_max_size
+        self.enforce_even_blocks = gpt_config.enforce_even_blocks
+        self.swa_ramp_start_step = gpt_config.swa_ramp_start_step
+        self.swa_ramp_end_step = gpt_config.swa_ramp_end_step
+        self.swa_window_coeff_m = gpt_config.swa_window_coeff_m
+        self.swa_window_coeff_n = gpt_config.swa_window_coeff_n
+        self.swa_step_coeff_m = gpt_config.swa_step_coeff_m
+        self.swa_step_coeff_n = gpt_config.swa_step_coeff_n
+
+        if (self.use_doc_masking or self.use_sliding_window_attention or self.use_attn_logit_softcapping):
+            assert self.use_flex_attention, "Document masking / SWA / attention soft-capping require use_flex_attention=True"
+        if self.use_sliding_window_attention:
+            assert self.sliding_window_max_size > 0, "sliding_window_max_size must be > 0 with use_sliding_window_attention=True"
+            assert self.sliding_window_max_size % self.flex_block_size == 0, "sliding_window_max_size must be a multiple of flex_block_size"
+            if self.use_sliding_window_size_ramp:
+                assert self.sliding_window_min_size > 0, "sliding_window_min_size must be > 0 with use_sliding_window_size_ramp=True"
+                assert self.sliding_window_min_size % self.flex_block_size == 0, "sliding_window_min_size must be a multiple of flex_block_size"
+                assert self.sliding_window_max_size >= self.sliding_window_min_size, "SWA final window size must be >= starting window size if SWA window size ramp up is enabled"
+                assert self.swa_ramp_end_step >= self.swa_ramp_start_step, "SWA ramp final update step must be >= starting update step"
+                self.initial_sliding_window_size = self.sliding_window_min_size
+        else:
+            self.initial_sliding_window_size = self.sliding_window_max_size
+        # register as a 0-dim tensor buffer so torch.compile treats it as a dynamic tensor input
+        self.register_buffer(
+            "sliding_window_size",
+            torch.tensor(self.initial_sliding_window_size, dtype=torch.int32),
+            # no need to save in model checkpoints, it's set by step count
+            persistent=False
+        )
 
         if self.pos_encoding_type == "rope" or self.pos_encoding_type == "nope":
             self.transformer = nn.ModuleDict(dict(
-                wte = nn.Embedding(config.vocab_size, config.d_model),
-                h = nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
-                ln_f = nn.RMSNorm(config.d_model) if config.norm_type.lower() == "rms" else nn.LayerNorm(config.d_model),
+                wte = nn.Embedding(gpt_config.vocab_size, gpt_config.d_model),
+                h = nn.ModuleList([Block(gpt_config, training_config) for _ in range(gpt_config.n_layers)]),
+                ln_f = nn.RMSNorm(gpt_config.d_model) if gpt_config.norm_type.lower() == "rms" else nn.LayerNorm(gpt_config.d_model),
             ))
         else:
             self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.d_model),
-            wpe = nn.Embedding(config.max_seq_len, config.d_model),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layers)]),
-            ln_f = nn.RMSNorm(config.d_model) if config.norm_type.lower() == "rms" else nn.LayerNorm(config.d_model),
+            wte = nn.Embedding(gpt_config.vocab_size, gpt_config.d_model),
+            wpe = nn.Embedding(training_config.max_seq_len, gpt_config.d_model),
+            h = nn.ModuleList([Block(gpt_config, training_config) for _ in range(gpt_config.n_layers)]),
+            ln_f = nn.RMSNorm(gpt_config.d_model) if gpt_config.norm_type.lower() == "rms" else nn.LayerNorm(gpt_config.d_model),
         ))
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(gpt_config.d_model, gpt_config.vocab_size, bias=False)
         
-        self.use_tied_embeddings = config.use_tied_embeddings
+        self.use_tied_embeddings = gpt_config.use_tied_embeddings
         if self.use_tied_embeddings:
             self.transformer.wte.weight = self.lm_head.weight
         self.apply(self._init_weights)
 
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -886,7 +1429,14 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def configure_optimizers(self, lr, betas, eps, weight_decay, device_type):
+    def configure_optimizers(
+            self,
+            lr: float,
+            adamw_betas: Tuple[float, float],
+            adamw_eps: float,
+            adamw_weight_decay: float,
+            device_type: str,
+            ) -> Dict[str, torch.optim.Optimizer]:
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
@@ -901,7 +1451,7 @@ class GPT(nn.Module):
         decay_params = [p for n, p in param_dict.items() if (n not in muon_param_names) and (p.dim() >= 2)]
         nodecay_params = [p for n, p in param_dict.items() if (n not in muon_param_names) and (p.dim() < 2)]
         optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': decay_params, 'weight_decay': adamw_weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
 
@@ -926,7 +1476,7 @@ class GPT(nn.Module):
             print(message)
             log_buffer.append(message)
 
-        adamw = torch.optim.AdamW(optim_groups, lr=lr, betas=betas, eps=eps, fused=use_fused)
+        adamw = torch.optim.AdamW(optim_groups, lr=lr, betas=adamw_betas, eps=adamw_eps, fused=use_fused)
 
         # if not using Muon, still return a dict for consistency with the training loop
         if self.optimizer_type != "muon":
@@ -938,56 +1488,370 @@ class GPT(nn.Module):
             muon_params,
             lr=lr * self.muon_lr_scale,
             momentum=self.muon_momentum,
-            nesterov=self.use_nesterov,
+            nesterov=self.muon_use_nesterov,
             backend=self.muon_backend,
             backend_steps=self.muon_backend_steps,
         )
         return {"adamw": adamw, "muon": muon}
     
-    def _build_flex_attn_block_mask(self, attn_mask, document_ids, gpu_batch_size, seq_len, device, ignore_doc_mask=False):
-        # static part: causal and sliding window
-        sliding_enabled = self.use_sliding_window_attention and (self.sliding_window_size > 0)
+    def _build_flex_attn_block_mask(
+            self,
+            attn_mask: Optional[Tensor],
+            document_ids: Optional[Tensor],
+            gpu_batch_size: int,
+            seq_len: int,
+            device: Union[str, torch.device],
+            ignore_doc_mask: bool = False,
+            ) -> Optional[BlockMask]:
+        # Attention builds, per sequence, a matrix of shape (seq_len, seq_len) when it does Q @ K^T
+        # Splitting into 128x128 blocks (if block_size=128), each a 128×128 submatrix of 128 rows
+        # (queries) × 128 columns (keys), we get:
+        #                                       ┌───────────┬───────────┬───────────┬───────────┐
+        #   queries 0-127                       │   (0,0)   │   (0,1)   │   (0,2)   │   (0,3)   │
+        #                                       ├───────────┼───────────┼───────────┼───────────┤
+        #   queries 128-255                     │   (1,0)   │   (1,1)   │   (1,2)   │   (1,3)   │
+        #                                       ├───────────┼───────────┼───────────┼───────────┤
+        #   ...                                 │   (2,0)   │   (2,1)   │   (2,2)   │   (2,3)   │
+        #                                       ├───────────┼───────────┼───────────┼───────────┤
+        # queries (seq_len-128)-(seq_len-1)     │   (3,0)   │   (3,1)   │   (3,2)   │   (3,3)   │
+        #                                       └───────────┴───────────┴───────────┴───────────┘
+        #                                        keys 0-127  keys 128-255    ...     keys (seq_len-128)-(seq_len-1)
+        
+        # In other words, (seq_len, seq_len) → (num_blocks_per_axis, num_blocks_per_axis)
+        # The goal is to skip applying a mask to the full matrix, and prematurely
+        # determine which blocks of 128x128 can compute full attention, 
+        # which need partial masking and which can be dropped entirely
+        
+        # - full: every (q,k) pair in the tile is allowed → we can skip pointwise masking on this block
+        # - partial: some (q,k) pairs are allowed → we must run pointwise masking on this block
+        # - none: no (q,k) pairs are allowed → we can drop the block entirely
+
+        # Now, we have various causes of masking:
+        # is_causal: q shouldn't look into the future (we allow q >= k, prevent k > q)
+        # use_doc_masking: q and k must share the same doc id (to avoid looking at keys from other docs)
+        # attn_mask: both tokens must be valid (which, in our case, means both not being padding)
+ 
+        # The speedup comes when we do not call create_block_mask at all and instead hand FlexAttention 
+        # a BlockMask that already says, per query block, which KV blocks are:
+        # - full-attn (no pointwise mask needed → mask_mod is skipped)
+        # - partial (pointwise mask_mod still runs, but only on those tiles)
+
+        block_size = self.flex_block_size
+        assert seq_len % block_size == 0, f"seq_len {seq_len} must be a multiple of flex_block_size {block_size}"
+
+        sliding_enabled = self.use_sliding_window_attention
         window_size = self.sliding_window_size
 
-        def static_mask_mod(batch_index, head_index, query_index, key_index):
+        # per token static (i.e., reused across training steps) steps mask
+        def flex_static_mask_mod(batch_index, head_index, query_index, key_index):
+            # causal mask
             if self.is_causal:
-                keep_flag = (query_index >= key_index)
+                keep_flag = query_index >= key_index
             else:
                 keep_flag = torch.ones((), dtype=torch.bool, device=device)
-
+            # SWA mask
             if sliding_enabled:
                 if self.is_causal:
                     keep_flag = keep_flag & ((query_index - key_index) <= window_size)
                 else:
                     keep_flag = keep_flag & (torch.abs(query_index - key_index) <= window_size)
             return keep_flag
+        mask_mod = flex_static_mask_mod
 
-        mask_mod = static_mask_mod
-
-        # validity / padding from a 2D attention mask [gpu_batch_size, seq_len]
+        # per token dynamic (i.e., can change across training steps) masks
         if attn_mask is not None:
+            # custom (padding) mask
             def valid_mask_mod(batch_index, head_index, query_index, key_index):
                 return attn_mask[batch_index, query_index] & attn_mask[batch_index, key_index]
             mask_mod = and_masks(mask_mod, valid_mask_mod)
-
-        # same-document constraint using document_ids [gpu_batch_size, seq_len]
         if self.use_doc_masking and not ignore_doc_mask and (document_ids is not None):
+            # doc mask
             def same_doc_mod(batch_index, head_index, query_index, key_index):
                 return document_ids[batch_index, query_index] == document_ids[batch_index, key_index]
             mask_mod = and_masks(mask_mod, same_doc_mod)
 
-        # create a single block mask shared across heads for this batch
-        block_mask = create_block_mask(
+        # tiny bit faster path: supports gpu_batch_size >= 1, but currently needs is_causal, plus used 
+        # only for training to avoid hitting re-compilation
+        # Builds full/partial blocks up front, uses from_kv_blocks to skip applying mask_mod to certain blocks
+        # -- Start of (modified) source: https://github.com/KellerJordan/modded-nanogpt/blob/master/records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt --
+        if self.is_causal and self.training:
+            # there are (seq_len // block_size)^2 total blocks, and seq_len // block_size per 
+            # axis (i.e., per row or column), e.g., 1024 // 128 = 8 blocks per axis
+            num_blocks_per_axis = seq_len // block_size
+            # e.g., 0, 1,..., 7
+            block_indices = torch.arange(num_blocks_per_axis, dtype=torch.int32, device=device)
+
+            # Each block covers token indices:
+            # for queries: q ∈ [i*block_size, (i+1)*block_size-1] with i=0..num_blocks_per_axis-1
+            # for keys:    k ∈ [j*block_size, (j+1)*block_size-1] with j=0..num_blocks_per_axis-1
+            # and we will compute 2 variables for each of causal, doc, and attn_mask masks:
+            # - which blocks are fully dense or valid, i.e., all (q, k) pairs are valid
+            # - which blocks are sparse, i.e., some (q, k) pairs are valid, yet not all
+
+            # Starting with causality:
+            # block_indices is e.g. (8,), and inserting a length-1 dimension at the end,
+            # via block_indices[:, None], we make it (8,1), which makes the operation:
+            # block_indices[:, None] >= block_indices broadcast (8,) into (1,8)
+            # to result in (8,1) op (1,8) → an (8,8) or (num_blocks_per_axis, num_blocks_per_axis) tensor;
+            # to simplify, assuming seq_len 8, and block_size 2 (num_blocks_per_axis=4), we have:
+            # [[True,  False, False, False],
+            #  [True,  True,  False, False],
+            #  [True,  True,  True,  False],
+            #  [True,  True,  True,  True]]
+            # with the tensor having True values for blocks at least partially (causally) valid
+            causal_partially_valid_blocks_2d = block_indices[:, None] >= block_indices
+            # on the other hand, if we are more strict and all True values are blocks fully (causally) valid
+            # (which excludes the diagonal since some elements have q < k), we have:
+            # [[False, False, False, False],
+            #  [True,  False, False, False],
+            #  [True,  True,  False, False],
+            #  [True,  True,  True,  False]]
+            causal_fully_valid_blocks_2d = block_indices[:, None] > block_indices
+            # broadcast the 2D pattern across batch: (gpu_batch_size, num_blocks_per_axis, num_blocks_per_axis)
+            causal_partially_valid_blocks = causal_partially_valid_blocks_2d.expand(gpu_batch_size, -1, -1)
+            causal_fully_valid_blocks     = causal_fully_valid_blocks_2d.expand(gpu_batch_size, -1, -1)
+
+            # Moving on to doc ids:
+            # if at least one (q, k) pair in the block share the same doc, it is partially (doc-wise) valid
+            # if all (q, k) pairs in the block share the same doc, it is fully (doc-wise) valid
+            if self.use_doc_masking and not ignore_doc_mask and (document_ids is not None):
+                # take each sequence in the batch independently
+                # e.g., for one sequence in the batch:
+                # document_ids[b] = [0,0, 0,1, 1,1, 2,2]
+                # blocks [0,0] | [0,1] | [1,1] | [2,2]
+                # document_ids has shape (gpu_batch_size, seq_len); here, (B, seq_len)
+                # so for one sequence we would take seq_len, e.g.,
+                # [0, 0, 0, 1, 1, 1, 2, 2]
+                docs = document_ids.to(device=device)
+                # and then the lowest and highest doc id in each block_size, e.g., if block size was 2:
+                # [0, 0, 0, 1, 1, 1, 2, 2] → view → [[0, 0], [0, 1], [1, 1], [2, 2]]
+                # the lowest doc id per block would be [0, 0, 1, 2], with size (num_blocks_per_axis,)
+                docs_view = docs.view(gpu_batch_size, num_blocks_per_axis, block_size)
+                docs_low  = docs_view[:, :,  0].contiguous()
+                # and the highest doc id per block would be [0, 1, 1, 2], with size (num_blocks_per_axis,)
+                docs_high = docs_view[:, :, -1].contiguous()
+                # (num_blocks_per_axis, 1) op (num_blocks_per_axis,) → 
+                # (num_blocks_per_axis, 1) op (num_blocks_per_axis,) left padded to (1, num_blocks_per_axis) → 
+                # (num_blocks_per_axis, num_blocks_per_axis), i.e., for one sequence:
+                # -------------------------------------------------------------------------
+                # (docs_low[:, None] <= docs_high):
+                # [[True,  True,  True,  True],  because 0 <= 0,  0 <= 1,  0 <= 1,   0 <= 2
+                # [ True,  True,  True,  True],  because 0 <= 0,  0 <= 1,  0 <= 1,   0 <= 2
+                # [ False, True,  True,  True],  because 1 !<= 0, 1 <= 1,  1 <= 1,   1 <= 2
+                # [ False, False, False, True]], because 2 !<= 0, 2 !<= 1, 2 !<= 1,  2 <= 2
+                # -------------------------------------------------------------------------
+                # (docs_high[:, None] >= docs_low):
+                # [[True, True, False, False],   because 0 >= 0,  0 >= 0,  0 !>= 1,  0 !>= 2
+                #  [True, True, True,  False],   because 1 >= 0,  1 >= 0,  1 >= 1,   1 !>= 2
+                #  [True, True, True,  False],   because 1 >= 0,  1 >= 0,  1 >= 1,   1 !>= 2
+                #  [True, True, True,  True]]    because 2 >= 0,  2 >= 0,  2 >= 1,   2 >= 2
+                # -------------------------------------------------------------------------
+                # (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low):
+                # [[True,  True,  False, False], because block 0's doc ids at least partially overlap with 0 and 1
+                #  [True,  True,  True,  False], because block 1's doc ids at least partially overlap with 0, 1, 2
+                #  [False, True,  True,  False], because block 2's doc ids at least partially overlap with 1 and 2
+                #  [False, False, False, True]]  because block 3's doc ids at least partially overlap with 3
+                doc_partially_valid_blocks = (
+                    (docs_low[:, :, None] <= docs_high[:, None, :]) &
+                    (docs_high[:, :, None] >= docs_low[:, None, :])
+                )
+                # while for full (q,k) doc validity, we get:
+                # -------------------------------------------------------------------------
+                # (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
+                # [[True,  False, False, False],  because all block 0's (q,k) share the same doc id in block 0
+                #  [False, False, False, False],  because all block 1's (q,k) share the same doc id in *no block*
+                #  [False, False, True,  False],  because all block 2's (q,k) share the same doc id in block 2
+                #  [False, False, False, True]]   because all block 3's (q,k) share the same doc id in block 3
+                # recalling that:
+                # block 0 [0, 0]
+                # block 1 [0, 1]
+                # block 2 [1, 1]
+                # block 3 [2, 2]
+                doc_fully_valid_blocks = (
+                    (docs_low[:, :, None] == docs_high[:, None, :]) & 
+                    (docs_high[:, :, None] == docs_low[:, None, :])
+                )
+            else:
+                doc_partially_valid_blocks = torch.ones(
+                    (gpu_batch_size, num_blocks_per_axis, num_blocks_per_axis), dtype=torch.bool, device=device
+                )
+                doc_fully_valid_blocks = doc_partially_valid_blocks
+
+            # Finally, for padding -or other custom attn_mask-:
+            if attn_mask is not None:
+                # e.g., for one sequence in the batch: [True, True, True, True, True, False, False, False]
+                valid = attn_mask.to(device=device, dtype=torch.bool)
+                # viewing the valid tokens as [[True, True], [True, True], [True, False], [False, False]] per sequence
+                valid_blocks = valid.view(gpu_batch_size, num_blocks_per_axis, block_size)
+                # q any indicates whether there is any query valid in the block:
+                # [True, True, True, False] per sequence
+                q_any = valid_blocks.any(dim=2)
+                # k any indicates whether there is any key valid in the block:
+                # [True, True, True, False] per sequence
+                k_any = valid_blocks.any(dim=2)
+                # in this case, q_any == k_any
+                # q all indicates whether all queries are valid in the block:
+                # [True, True, False, False] per sequence
+                q_all = valid_blocks.all(dim=2)
+                # k all indicates whether all keys are valid in the block:
+                # [True, True, False, False] per sequence
+                k_all = valid_blocks.all(dim=2)
+                # in this case, q_all == k_all
+                # -------------------------------------------------------------------------
+                # q_any[:, :, None] & k_any[:, None, :]:
+                # [[True,  True,   True,  False],
+                #  [True,  True,   True,  False],
+                #  [True,  True,   True,  False],
+                #  [False, False,  False, False]] per sequence
+                attn_mask_blockmask_any = q_any[:, :, None] & k_any[:, None, :]
+                # -------------------------------------------------------------------------
+                # q_all[:, :, None] & k_all[:, None, :]:
+                # [[True,  True,  False,  False],
+                #  [True,  True,  False,  False],
+                #  [False, False, False,  False],
+                #  [False, False, False,  False]] per sequence
+                attn_mask_blockmask_all = q_all[:, :, None] & k_all[:, None, :]
+                # -------------------------------------------------------------------------
+            else:
+                attn_mask_blockmask_any = torch.ones(
+                    (gpu_batch_size, num_blocks_per_axis, num_blocks_per_axis), dtype=torch.bool, device=device
+                )
+                attn_mask_blockmask_all = attn_mask_blockmask_any
+
+            # combining the constraints:
+            # blockmask_any → tiles that may have some valid (q,k) pairs and must run mask_mod pointwise, e.g.,
+            # [[True,  False, False, False],
+            #  [True,  True,  False, False],
+            #  [False, True,  True,  False],
+            #  [False, False, False, False]] per sequence
+            blockmask_any = causal_partially_valid_blocks & doc_partially_valid_blocks & attn_mask_blockmask_any
+            # blockmask_all → tiles that are guaranteed fully dense and can skip mask_mod, e.g.,
+            # [[False, False, False, False],
+            #  [False, False, False, False],
+            #  [False, False, False, False],
+            #  [False, False, False, False]] per sequence
+            blockmask_all = causal_fully_valid_blocks & doc_fully_valid_blocks & attn_mask_blockmask_all
+
+            def map_to_ordered(blockmask_full_or_partial):
+                # map (num_blocks_per_axis, num_blocks_per_axis) into its ordered representation
+                # and return blockmask and sort-indices, both as (B?, H?, num_query_blocks)
+                num_valid_kv_blocks_per_q_block = blockmask_full_or_partial.sum(dim=-1, dtype=torch.int32)
+                # descending=False argsort → False before True
+                # stable=True argsort      → keep order of appearance, e.g., [True, True] → [0, 1] (and not [1, 0])
+                # row 0 of blockmask_any & ~blockmask_all is [True,  False, False, False] →
+                # argsort(False-first) gives indices [1, 2, 3, 0] → flipped is [0, 3, 2, 1] (True-first)
+                # row 1 of blockmask_any & ~blockmask_all is [True,  True,  False, False]
+                # argsort(False-first) gives indices [2, 3, 0, 1] → flipped is [1, 0, 3, 2] (True-first)
+                # row 2 of blockmask_any & ~blockmask_all is [False, True,  True,  False]
+                # argsort(False-first) gives indices [0, 3, 1, 2] → flipped is [2, 1, 3, 0] (True-first)
+                # row 3 of blockmask_any & ~blockmask_all is [False, False, False, False]
+                # argsort(False-first) gives indices [0, 1, 2, 3] → flipped is [3, 2, 1, 0] (True-first)
+                fully_valid_kv_indices = blockmask_full_or_partial.argsort(dim=-1, descending=False, 
+                                                                        stable=True).flip(-1).to(torch.int32)
+                # BlockMask expects (B?, H?, num_query_blocks), so we insert two leading dims; 
+                # and flip() may produce a non-contiguous view, so we call contiguous(), resulting in, e.g.,
+                # -------------------------------------------------------------------------
+                # (given) blockmask_any & ~blockmask_all:
+                # -------------------------------------------------------------------------
+                # [[True,  False, False, False],
+                #  [True,  True,  False, False],
+                #  [False, True,  True,  False],
+                #  [False, False, False, False]] per sequence
+                # -------------------------------------------------------------------------
+                # num_only_partially_valid_kv_blocks:
+                # -------------------------------------------------------------------------
+                # [[[1, 2, 2, 0]]] because row 0: 1 valid block; rows 1-2: 2; row 3: 0 (per sequence)
+                # -------------------------------------------------------------------------
+                # only_partial_kv_indices and while other orders are possible,
+                # this keeps elements closest to the diagonal,
+                # e.g., if SWA and sliding_window_max_size_blocks=1,
+                # index 0 is kept for the first row (because it is the first column and we keep only 1 block)
+                # index 1 is kept for the second row (because it is the first column and we keep only 1 block)
+                # index 2 is kept for the third row (because it is the first column and we keep only 1 block)
+                # index 3 is kept for the fourth row (because it is the first column and we keep only 1 block)
+                # NOTE:
+                # Despite not being used in this fast path (the path enforces is_causal), it must be noted:
+                # This order fails if not is_causal because it keeps last valid block(s), which if is_causal 
+                # is correct because future blocks are False, keeping the last *starting from the diagonal*, 
+                # but would take the last column(s) always if not is_causal)
+                # -------------------------------------------------------------------------
+                # [[[0,    3,     2,     1],
+                #   [1,    0,     3,     2],
+                #   [2,    1,     3,     0],
+                #   [3,    2,     1,     0]]] per sequence
+                return (num_valid_kv_blocks_per_q_block[:, None, :].contiguous(), 
+                        fully_valid_kv_indices[:, None, :].contiguous())
+
+            num_only_partially_valid_kv_blocks, only_partial_kv_indices = map_to_ordered(blockmask_any & ~blockmask_all)
+            num_fully_valid_kv_blocks, fully_valid_kv_indices = map_to_ordered(blockmask_all)
+
+            # when using block_size, window_size is not exact (e.g., 2 full blocks + 1 partial block attended to
+            # -in general, for block_size = 128 and window_size = 384 (window_size_blocks = 3)
+            # excluding doc and other attn masks, that means 128 + 128 + 64 attended to tokens (64 tokens short))-
+            if sliding_enabled:
+                # use tensor math: (window_size / block_size).ceil()
+                window_size_blocks = (window_size.float() / block_size).ceil().to(torch.int32)
+            else:
+                # convert the Python int to a 0-dim tensor for graph consistency
+                window_size_blocks = torch.tensor(num_blocks_per_axis, dtype=torch.int32, device=device)
+
+            # is_causal → the diagonal block is partial
+            # therefore, always exclude one full block per row to make room for the diagonal block (in other words,
+            # start counting window_size from the diagonal to the left)
+            clamped_num_fully_valid_kv_blocks = torch.clamp_max(num_fully_valid_kv_blocks, window_size_blocks - 1)
+            clamped_num_only_partially_valid_kv_blocks = torch.clamp_max(num_only_partially_valid_kv_blocks, 
+                                                                        window_size_blocks - clamped_num_fully_valid_kv_blocks)
+            
+            # https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html
+            return BlockMask.from_kv_blocks(
+                # -------------------------------------------------------------------------
+                # which KV tiles to visit for each query tile
+                # -------------------------------------------------------------------------
+                # kv_num_blocks (Tensor) – Number of kv_blocks in each Q_BLOCK_SIZE row tile
+                clamped_num_only_partially_valid_kv_blocks,
+                # kv_indices (Tensor) – Indices of key-value blocks in each Q_BLOCK_SIZE row tile
+                only_partial_kv_indices,
+                # -------------------------------------------------------------------------
+                # subset of the above that are known to be fully dense 
+                # (every (q,k) pair in the tile is valid)
+                # -------------------------------------------------------------------------
+                # full_kv_num_blocks (Optional[Tensor]) – Number of full kv_blocks 
+                # in each Q_BLOCK_SIZE row tile
+                clamped_num_fully_valid_kv_blocks,
+                # full_kv_indices (Optional[Tensor]) – Indices of full key-value blocks 
+                # in each Q_BLOCK_SIZE row tile
+                fully_valid_kv_indices,
+                # -------------------------------------------------------------------------
+                # per-element boolean function (b,h,q_idx,k_idx) -> bool that's applied 
+                # inside partial tiles to zero out disallowed (q,k) pairs
+                # (required if is_causal due to partial diagonal tiles)
+                # -------------------------------------------------------------------------
+                # BLOCK_SIZE (Union[int, tuple[int, int]]) – Size of KV_BLOCK_SIZE x Q_BLOCK_SIZE tiles
+                BLOCK_SIZE=block_size,
+                # mask_mod (Optional[Callable]) – Function to modify the mask
+                mask_mod=mask_mod,
+            )
+        # -- End of (modified) source: https://github.com/KellerJordan/modded-nanogpt/blob/master/records/071225_BosAlign/c1fd8a38-bb9f-45c4-8af0-d37f70c993f3.txt --
+
+        # old path (for is_causal=False, validation, sampling, and hellaswag)
+        return create_block_mask(
             mask_mod,
             B=gpu_batch_size,
             H=None,
             Q_LEN=seq_len,
             KV_LEN=seq_len,
+            BLOCK_SIZE=block_size,
             _compile=self.training
         )
-        return block_mask
-    
-    def _normalize_attn_mask(self, attn_mask, gpu_batch_size, seq_len, device, for_flex):
+
+    def _normalize_attn_mask(
+            self,
+            attn_mask: Optional[Tensor],
+            gpu_batch_size: int,
+            seq_len: int,
+            device: Union[str, torch.device],
+            for_flex: bool,
+            ) -> Optional[Tensor]:
         if attn_mask is None:
             return None
         if attn_mask.dtype != torch.bool:
@@ -1013,7 +1877,14 @@ class GPT(nn.Module):
             allow_mask_4d = allow_mask_4d & allow_causal
         return allow_mask_4d
 
-    def forward(self, indices, targets=None, attn_mask=None, ignore_doc_mask=False, document_ids=None):
+    def forward(
+            self,
+            indices: Tensor,
+            targets: Optional[Tensor] = None,
+            attn_mask: Optional[Tensor] = None,
+            ignore_doc_mask: bool = False,
+            document_ids: Optional[Tensor] = None,
+            ) -> Tuple[Tensor, Optional[Tensor]]:
         # ignore_doc_mask to avoid using it in:
         # val, sampling, hellaswag
         # even if used in train
@@ -1070,25 +1941,99 @@ class GPT(nn.Module):
 ################################################
 #                Learning Rate                 #
 ################################################
-def get_lr(step):
-    if step < warmup_steps:
-        return (step + 1) * max_lr / warmup_steps
-    elif step >= warmup_and_cosine_steps:
-        lr = min_lr_after_warmup
+def get_adamw_lr(step) -> float:
+    if step < lr_warmup_steps:
+        return (step + 1) * adamw_max_lr / lr_warmup_steps
+    elif step >= lr_warmup_and_cosine_steps:
+        lr = adamw_min_lr_after_lr_warmup
     else:
-        coeff = 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (warmup_and_cosine_steps - warmup_steps)))
-        lr = min_lr_after_warmup + coeff * (max_lr - min_lr_after_warmup)
-    if hard_min_lr > 0:
-        lr = max(lr, hard_min_lr)
+        coeff = 0.5 * (1 + math.cos(math.pi * (step - lr_warmup_steps) / (lr_warmup_and_cosine_steps - lr_warmup_steps)))
+        lr = adamw_min_lr_after_lr_warmup + coeff * (adamw_max_lr - adamw_min_lr_after_lr_warmup)
+    if adamw_hard_min_lr > 0:
+        lr = max(lr, adamw_hard_min_lr)
     return lr
+
+################################################
+#             Sliding Window Size              #
+################################################
+def get_sliding_window_size(
+    step: int,
+    use_sliding_window_size_ramp: bool,
+    sliding_window_min_size: int,
+    sliding_window_max_size: int,
+    flex_block_size: int,
+    enforce_even_blocks: bool,
+    swa_ramp_start_step: int,
+    swa_ramp_end_step: int,
+    swa_window_coeff_m: float = 0.0,
+    swa_window_coeff_n: int = 1,
+    swa_step_coeff_m: float = 0.0,
+    swa_step_coeff_n: int = 100,
+    current_window_size: int = 128,
+    next_update_step: int = 0
+    ) -> Tuple[int, int]:
+    # no ramp
+    if not use_sliding_window_size_ramp or sliding_window_max_size == sliding_window_min_size:
+        # keep size (fast path):
+        # the first iteration, it could be snapped to align with flex_block_size or to an even number of blocks;
+        # afterwards (step 1 onward), we can safely return
+        if step >= 1:
+            # next_update_step (-1) is effectively unused
+            return current_window_size, -1
+        else:
+            # the first step, use sliding_window_max_size to finalize current_window_size
+            raw_sliding_window_size = sliding_window_max_size
+    # ramp
+    else:
+        # start at initial size (fast path)
+        if step < swa_ramp_start_step:
+            return sliding_window_min_size, swa_ramp_start_step
+        
+        # if we are at/past ramp steps, skip (future) calculations (fast path)
+        if step >= swa_ramp_end_step or current_window_size >= sliding_window_max_size:
+            return current_window_size, 2**63 - 1
+
+        # keep size (fast path)
+        if step < next_update_step:
+            return current_window_size, next_update_step
+    
+    # ramp update
+    # if we have not returned, an update is triggered
+    if use_sliding_window_size_ramp:
+        # window_size = window_size + (m * window_size) + (n * flex_block_size)
+        raw_sliding_window_size = int(current_window_size + (swa_window_coeff_m * current_window_size) + \
+        (swa_window_coeff_n * flex_block_size))
+        # next_update_step = next_update_step + (m * next_update_step) + (n * 1 step)
+        next_update_step = int(next_update_step + (swa_step_coeff_m * next_update_step) + swa_step_coeff_n)
+
+    # ramp/no ramp update
+    raw_sliding_window_size = max(raw_sliding_window_size, sliding_window_min_size)
+    raw_sliding_window_size = min(raw_sliding_window_size, sliding_window_max_size)
+
+    num_blocks_raw = raw_sliding_window_size // flex_block_size
+
+    if enforce_even_blocks:
+        final_num_blocks = math.ceil(num_blocks_raw / 2) * 2
+        final_size = final_num_blocks * flex_block_size
+    else:
+        final_num_blocks = num_blocks_raw
+        final_size = num_blocks_raw * flex_block_size
+
+    return final_size, next_update_step
 
 ################################################
 #                   Sampling                   #
 ################################################
-def get_sample_token_count(step, base=5, step_interval=1000, max_tokens=50):
+def get_sample_token_count(step: int, base: int = 5, step_interval: int = 1000, max_tokens: int = 50) -> int:
     return min(base + (step // step_interval) * base, max_tokens)
 
-def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_p=None):
+def sample(
+        sample_sequences: Sequence[str],
+        max_new_tokens: int = 5,
+        temperature: float = 0.7,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        ) -> None:
     gpt_model.eval()
     with torch.inference_mode():
         # convert all prompts to ids,
@@ -1108,7 +2053,7 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
         alloc_len = max_input_len + max_new_tokens
 
         # rounding up to a nice multiple for better tensor cores / GPU efficiency
-        round_multiple = 128 if raw_gpt_model.use_flex_attention else 8
+        round_multiple = (raw_gpt_model.flex_block_size if raw_gpt_model.use_flex_attention else 8)
         alloc_len = math.ceil(alloc_len / round_multiple) * round_multiple
         alloc_len = min(alloc_len, raw_gpt_model.max_seq_len)
 
@@ -1138,7 +2083,8 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
                 # and predict, resulting in (len(sample_sequences), seq_len, vocab_size)
                 # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
                 # so we can skip passing an attn_mask
-                logits, _ = raw_gpt_model(generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
+                eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+                logits, _ = eager_gpt_model(generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
             
             # of which we take the vocab_size values for each sequence's continuation to the last non-pad token,
             # resulting in len(sample_sequences), vocab_size
@@ -1362,7 +2308,7 @@ def sample(sample_sequences, max_new_tokens=5, temperature=1.0, top_k=None, top_
 # F.cross_entropy() calculates - F.log_softmax(), and then either it reduces to mean or we do so manually
 # ---------------------------------------------------------
 
-def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
+def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch: int = 16) -> float:
     hellaswag_examples_per_batch = max(1, hellaswag_examples_per_batch)
     max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
 
@@ -1442,7 +2388,7 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
 
             # allocate to the actual max length in this pass (rounded for kernels, capped to model max)
             max_len_in_batch = max(len(s) for s in all_seq_ids) if all_seq_ids else 1
-            round_multiple = 8
+            round_multiple = (raw_gpt_model.flex_block_size if raw_gpt_model.use_flex_attention else 8)
             alloc_len = min(max_model_seq_len, math.ceil(max_len_in_batch / round_multiple) * round_multiple)
 
             pre_allocated_input_ids = torch.full(
@@ -1462,7 +2408,9 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=pre_allocated_attn_mask, ignore_doc_mask=True)
+                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
+                # so we can skip passing an attn_mask
+                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             
             # log softmax: softmax followed by log (to sum log-probs vs. multiply low-value probs)
             log_probs = F.log_softmax(logits, dim=-1)
@@ -1522,7 +2470,7 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch=16):
     gpt_model.train()
     return accuracy
 
-def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
+def evaluate_hellaswag_standard(hellaswag_examples_per_batch: int = 16) -> float:
     hellaswag_examples_per_batch = max(1, hellaswag_examples_per_batch)
     max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
 
@@ -1584,7 +2532,7 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
 
             # allocate to the actual max length in this pass (rounded for kernels, capped to model max)
             max_len_in_batch = max(len(s) for s in all_seq_ids) if all_seq_ids else 1
-            round_multiple = 8
+            round_multiple = (raw_gpt_model.flex_block_size if raw_gpt_model.use_flex_attention else 8)
             alloc_len = min(max_model_seq_len, math.ceil(max_len_in_batch / round_multiple) * round_multiple)
 
             pre_allocated_input_ids = torch.full(
@@ -1604,7 +2552,9 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=pre_allocated_attn_mask, ignore_doc_mask=True)
+                # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
+                # so we can skip passing an attn_mask
+                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             
             log_probs = F.log_softmax(logits, dim=-1)
 
@@ -1663,7 +2613,7 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch=16):
 ################################################
 #                Checkpointing                 #
 ################################################
-def keep_latest_checkpoints(checkpoint_dir):
+def keep_latest_checkpoints(checkpoint_dir: str) -> None:
     all_files = os.listdir(checkpoint_dir)
 
     # group files by type
@@ -1696,9 +2646,24 @@ def keep_latest_checkpoints(checkpoint_dir):
         print(message)
         log_buffer.append(message)
 
-def save_checkpoint(step, torch_rng_state_cpu, torch_rng_state_cuda, val_loss, train_loss, train_tokens_processed,
-                    total_train_t, total_val_t, total_sample_t, total_hellaswag_t, total_t, best_val_loss, epoch,
-                    current_shard_idx, grad_accum_mini_steps_per_shard_counter, optimizers):
+def save_checkpoint(
+        step: int,
+        torch_rng_state_cpu: Tensor,
+        torch_rng_state_cuda: Tensor,
+        val_loss: float,
+        train_loss: float,
+        train_tokens_processed: int,
+        total_train_t: float,
+        total_val_t: float,
+        total_sample_t: float,
+        total_hellaswag_t: float,
+        total_t: float,
+        best_val_loss: float,
+        epoch: int,
+        current_shard_idx: int,
+        grad_accum_mini_steps_per_shard_counter: int,
+        optimizers: Dict[str, torch.optim.Optimizer],
+        ) -> None:
 
     # create the model path by adding its timestamp, and train and val losses, if available
     parts = [f"model", f"step_{step:07d}"]
@@ -1743,7 +2708,24 @@ def save_checkpoint(step, torch_rng_state_cpu, torch_rng_state_cuda, val_loss, t
     # retain last max_checkpoints_to_keep
     keep_latest_checkpoints(checkpoint_dir)
 
-def load_checkpoint():
+# TODO: fix checkpointing to handle the added logic of SWA ramp, ...
+def load_checkpoint() -> Tuple[
+    int,                                # start_step
+    Tensor,                             # torch_rng_state_cpu
+    Tensor,                             # torch_rng_state_cuda
+    int,                                # train_tokens_processed
+    float,                              # total_train_t
+    float,                              # total_val_t
+    float,                              # total_sample_t
+    float,                              # total_hellaswag_t
+    float,                              # total_t
+    float,                              # best_val_loss
+    int,                                # epoch
+    int,                                # current_shard_idx
+    int,                                # grad_accum_mini_steps_per_shard_counter
+    Dict[str, Any],                     # optimizer_state_dicts
+    "GPT",                              # gpt_model
+]:
     model_path = hf_hub_download(
         repo_id=hub_repo_id,
         filename=resume_checkpoint_path,
@@ -1767,8 +2749,8 @@ def load_checkpoint():
     }
     # print(list(model_state_dict.keys())[:5])
 
-    model_cfg = GPTConfig(max_seq_len=max(seq_len_train, seq_len_val))
-    gpt_model = GPT(model_cfg)
+    gpt_config = GPTConfig()
+    gpt_model = GPT(gpt_config, training_config)
     gpt_model.load_state_dict(model_state_dict, strict=False)
 
     # tie weights, creating wte.weight
@@ -1810,46 +2792,107 @@ torch.cuda.set_device(device)
 init_process_group(backend='nccl')
 master_process = ddp_rank == 0
 
+training_config = TrainingConfig()
+training_config.resolve(ddp_world_size)
+
+# steps and tokens
+total_tokens_per_step_train = training_config.total_tokens_per_step_train
+gpu_batch_size_train = training_config.gpu_batch_size_train
+gpu_batch_size_val = training_config.gpu_batch_size_val
+seq_len_train = training_config.seq_len_train
+seq_len_val = training_config.seq_len_val
+max_tokens = training_config.max_tokens
+# derived from the above
+max_seq_len = training_config.max_seq_len
+max_train_steps = training_config.max_train_steps
+# derived from the above and world size
+total_tokens_per_mini_step_train = training_config.total_tokens_per_mini_step_train
+grad_accum_mini_steps = training_config.grad_accum_mini_steps
+total_tokens_per_step_val = training_config.total_tokens_per_step_val
+val_steps = training_config.val_steps
+
+# tokenizer
+tokenizer = training_config.tokenizer
+
+# optimizers
+adamw_betas = training_config.adamw_betas
+adamw_eps = training_config.adamw_eps
+adamw_max_lr = training_config.adamw_max_lr
+adamw_min_lr_after_lr_warmup_ratio = training_config.adamw_min_lr_after_lr_warmup_ratio
+lr_warmup_tokens = training_config.lr_warmup_tokens
+lr_warmup_and_cosine_tokens = training_config.lr_warmup_and_cosine_tokens
+adamw_weight_decay = training_config.adamw_weight_decay
+adamw_hard_min_lr = training_config.adamw_hard_min_lr
+optimizer_type = training_config.optimizer_type
+muon_lr_scale = training_config.muon_lr_scale
+muon_backend = training_config.muon_backend
+muon_backend_steps = training_config.muon_backend_steps
+muon_momentum = training_config.muon_momentum
+muon_use_nesterov = training_config.muon_use_nesterov
+# derived from the above
+adamw_min_lr_after_lr_warmup = training_config.adamw_min_lr_after_lr_warmup
+lr_warmup_steps = training_config.lr_warmup_steps
+lr_warmup_and_cosine_steps = training_config.lr_warmup_and_cosine_steps
+min_lr_after_warmup = training_config.min_lr_after_warmup
+
+# checkpointing
+checkpoint_interval = training_config.checkpoint_interval
+max_checkpoints_to_keep = training_config.max_checkpoints_to_keep
+resume_from_checkpoint = training_config.resume_from_checkpoint
+resume_checkpoint_path = training_config.resume_checkpoint_path
+resume_state_dict_path = training_config.resume_state_dict_path
+resume_timestamp = training_config.resume_timestamp
+hf_user = training_config.hf_user
+hf_token = training_config.hf_token
+# derived from the above
+timestamp = training_config.timestamp
+checkpoint_dir = training_config.checkpoint_dir
+hub_repo_id = training_config.hub_repo_id
+
+# logging (derived from the above)
+config_and_log_dir = training_config.config_and_log_dir
+log_filename = training_config.log_filename
+config_filename = training_config.config_filename
+
+# dataloader
+data_path = training_config.data_path
+
+# validation
+val_target = training_config.val_target
+val_tokens = training_config.val_tokens
+shuffle_val_tokens = training_config.shuffle_val_tokens
+val_interval = training_config.val_interval
+train_val_margin = training_config.train_val_margin
+
+# sampling
+sample_interval = training_config.sample_interval
+sample_sequences = training_config.sample_sequences
+
+# hellaswag
+hellaswag_interval = training_config.hellaswag_interval
+
+# seeding
+base_seed = training_config.base_seed
+
+# kernel warmup
+kernel_warmup_train_steps = training_config.kernel_warmup_train_steps
+
 # buffer to 'write to disk' only at checkpointing steps, to avoid e.g. stopping training at step 233,
 # restoring a model from step 200 -last val step that improves val loss-  and having training logs up
 # to 233 then continuing from 201 (e.g., 232, 233, 201, 202, ...).
 # This ensures training losses are stored only after a checkpointing step happens.
 log_buffer = []
 
-total_tokens_per_step_train = 2**18 # 2**19 == 524,288 or ~0.5M tokens from Language Models are Few-Shot Learners
-factor = 2
-gpu_batch_size_train = 64 // factor
-gpu_batch_size_val = 64 // factor
-seq_len_train =  1024 * factor
-seq_len_val = 1024 * factor
-
-total_tokens_per_mini_step_train = ddp_world_size * gpu_batch_size_train * seq_len_train
-grad_accum_mini_steps = total_tokens_per_step_train // total_tokens_per_mini_step_train
-assert total_tokens_per_step_train % total_tokens_per_mini_step_train == 0
 if master_process:
     message = f"per-gpu gradient accumulation mini-steps: {grad_accum_mini_steps}"
     print(message)
     log_buffer.append(message)
 
-betas = (0.9,0.95)
-eps = 1e-8
-max_lr = 5e-3 # 4e-3 | 5e-3
-min_lr_after_warmup_ratio = 0.15
-warmup_tokens = 0
-warmup_and_cosine_tokens = 800*10**6
-max_tokens = 5*10**9
-weight_decay = 0.1
-hard_min_lr = 7e-4
-
-max_steps = max_tokens // total_tokens_per_step_train
-min_lr_after_warmup = min_lr_after_warmup_ratio * max_lr
-warmup_steps = warmup_tokens // total_tokens_per_step_train
-warmup_and_cosine_steps = warmup_and_cosine_tokens // total_tokens_per_step_train
 if master_process:
     messages = [
-        f"warmup steps: {warmup_steps:,}",
-        f"warmup and cosine steps: {warmup_and_cosine_steps:,}",
-        f"max steps: {max_steps:,}"
+        f"lr warmup steps: {lr_warmup_steps:,}",
+        f"lr warmup and cosine steps: {lr_warmup_and_cosine_steps:,}",
+        f"max train steps: {max_train_steps:,}"
     ]
     for message in messages:
         print(message)
@@ -1857,57 +2900,15 @@ if master_process:
 
 torch.set_float32_matmul_precision('high')
 
-tokenizer = tiktoken.get_encoding("gpt2")
-
-val_target = 3.28
-val_tokens = 2 ** 21 * 5
-val_steps = math.ceil(val_tokens / (ddp_world_size * gpu_batch_size_val * seq_len_val))
-val_interval = 50
-total_tokens_per_step_val = ddp_world_size * gpu_batch_size_val * seq_len_val
 if master_process:
     print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_step_val:,} tokens per val step)")
+
 # to save compute, start running validation when training loss + train_val_margin <= val_target
-train_val_margin = 0.05
 allow_val = False
-
-sample_interval = 4000
-sample_sequences = [
-    "The universe has always been",
-    "Who am I? I am a language model",
-    "Artificial General Intelligence is",
-    "Artificial General Intelligence is not",
-    "2+2 is",
-    "The quick brown fox jumps",
-    "Earth is",
-    "Could you tell me what time it is?"
-]
-
-hellaswag_interval = float('inf')
-
-# checkpoint_interval = 1000
-max_checkpoints_to_keep = -1
-resume_from_checkpoint = False
-resume_checkpoint_path = "model_step_0000125_val_6.8745_train_6.9019.safetensors"
-resume_state_dict_path = "training_state_step_0000125.pt"
-
-if not resume_from_checkpoint:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-else:
-    timestamp = "20250801_085237"
-
-config_and_log_dir = f"./configs_and_logs/{timestamp}"
-log_filename = os.path.join(config_and_log_dir, f"log.txt")
-config_filename = os.path.join(config_and_log_dir, f"config.txt")
-
-checkpoint_dir = f"./checkpoints/{timestamp}"
 
 if master_process:
     os.makedirs(config_and_log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
-
-hf_user = os.environ.get("hf_user")
-hf_token = os.environ.get("hf_token")
-hub_repo_id = f"{hf_user}/nanogpt_{timestamp}"
 
 start_step = 0
 train_tokens_processed = 0
@@ -1917,8 +2918,6 @@ total_sample_t = 0.0
 total_hellaswag_t = 0.0
 total_t = 0.0
 best_val_loss = float('inf')
-
-base_seed = 1337
 
 epoch = 0
 current_shard_idx = 0
@@ -1931,7 +2930,7 @@ torch.cuda.manual_seed(seed)
 ################################################
 #           Model Building / Loading           #
 ################################################
-model_cfg = GPTConfig(max_seq_len=max(seq_len_train, seq_len_val))
+gpt_config = GPTConfig()
 if resume_from_checkpoint:
     # get start_step, train dataloader config (epoch, grad_accum_mini_steps_per_shard_counter, etc.),
     # optimizer state and model
@@ -1952,7 +2951,7 @@ if resume_from_checkpoint:
     gpt_model = torch.compile(gpt_model)
     gpt_model = DDP(gpt_model, device_ids=[ddp_local_rank])
     raw_gpt_model = gpt_model.module
-    optimizers = raw_gpt_model.configure_optimizers(max_lr, betas, eps, weight_decay, device_type)
+    optimizers = raw_gpt_model.configure_optimizers(adamw_max_lr, adamw_betas, adamw_eps, adamw_weight_decay, device_type)
     # use the downloaded optimizer_state_dicts for the optimizers
     for k, optimizer in optimizers.items():
         if k in optimizer_state_dicts:
@@ -1964,32 +2963,32 @@ if resume_from_checkpoint:
     # wait for all ranks to sync
     dist.barrier()
 else:
-    gpt_model = GPT(model_cfg)
+    gpt_model = GPT(gpt_config, training_config)
     gpt_model.to(device)
     #gpt_model = torch.compile(gpt_model, mode="max-autotune", fullgraph=True, dynamic=False)
     gpt_model = torch.compile(gpt_model)
     gpt_model = DDP(gpt_model, device_ids=[ddp_local_rank])
     raw_gpt_model = gpt_model.module
-    optimizers = raw_gpt_model.configure_optimizers(max_lr, betas, eps, weight_decay, device_type)
+    optimizers = raw_gpt_model.configure_optimizers(adamw_max_lr, adamw_betas, adamw_eps, adamw_weight_decay, device_type)
 
 ################################################
 #             DataLoader Building              #
 ################################################
-data_path = "./data/edu_fineweb10B"
 # if resume_from_checkpoint: epoch, current_shard_idx, and grad_accum_mini_steps_per_shard_counter are overriden
 # above and thus set to non-zero values in the DataLoader()
 train_data_loader = DataLoader(
     gpu_batch_size_train, seq_len_train, ddp_world_size, ddp_rank, data_path, "train",
     epoch=epoch, current_shard_idx=current_shard_idx,
     grad_accum_mini_steps_per_shard_counter=grad_accum_mini_steps_per_shard_counter,
-    pad_token_id=model_cfg.pad_token_id, eos_token_id=model_cfg.eos_token_id,
+    pad_token_id=gpt_config.pad_token_id, eos_token_id=gpt_config.eos_token_id,
     return_document_ids=raw_gpt_model.use_doc_masking,
 )
 val_data_loader = DataLoader(
     gpu_batch_size_val, seq_len_val, ddp_world_size, ddp_rank, data_path, "val",
     epoch=0, current_shard_idx=0, grad_accum_mini_steps_per_shard_counter=0,
-    pad_token_id=model_cfg.pad_token_id, eos_token_id=model_cfg.eos_token_id,
+    pad_token_id=gpt_config.pad_token_id, eos_token_id=gpt_config.eos_token_id,
     return_document_ids=raw_gpt_model.use_doc_masking,
+    shuffle_val_tokens=shuffle_val_tokens,
 )
 
 ################################################
@@ -2017,49 +3016,45 @@ dist.barrier()
 ################################################
 #             Config Saving to file            #
 ################################################
-def save_config_info():
+def save_config_info() -> None:
     with open(config_filename, "w") as f:
         f.write(f"timestamp: {timestamp}\n")
+        f.write(f"ddp world size: {ddp_world_size}\n\n")
 
-        f.write(f"ddp world size: {ddp_world_size}\n")
+        f.write("\n###################")
+        f.write("\n# Training Config #")
+        f.write("\n###################\n")
+        for config_field in fields(training_config):
+            if config_field.name in ['hf_user', 'hf_token']:
+                 continue
+            elif config_field.name == 'tokenizer':
+                 f.write(f"tokenizer: gpt2 (tiktoken)\n")
+            elif config_field.init is False:
+                 continue
+            else:
+                value = getattr(training_config, config_field.name)
+                f.write(f"{config_field.name}: {value}\n")
 
-        f.write(f"total tokens per step (train): {total_tokens_per_step_train}\n")
-        f.write(f"gpu batch size (train): {gpu_batch_size_train}\n")
-        f.write(f"gpu batch size (val): {gpu_batch_size_val}\n")
-        f.write(f"seq len (train): {seq_len_train}\n")
-        f.write(f"seq len (val): {seq_len_val}\n")
-        f.write(f"total tokens per mini-step (train): {total_tokens_per_mini_step_train}\n")
-        f.write(f"grad accum mini-steps: {grad_accum_mini_steps}\n")
-        f.write(f"total tokens per step (val): {total_tokens_per_step_val}\n")
-        
-        f.write(f"betas: {betas}\n")
-        f.write(f"eps: {eps}\n")
-        f.write(f"max lr: {max_lr}\n")
-        f.write(f"min lr after warmup ratio: {min_lr_after_warmup_ratio}\n")
-        f.write(f"warmup tokens: {warmup_tokens}\n")
-        f.write(f"warmup and cosine tokens: {warmup_and_cosine_tokens}\n")
-        f.write(f"max tokens: {max_tokens}\n")
-        f.write(f"weight decay: {weight_decay}\n")
-        f.write(f"hard min lr: {hard_min_lr}\n")
+        f.write("\n###########################")
+        f.write("\n# Derived Training Config #")
+        f.write("\n###########################\n")
+        f.write(f"total_tokens_per_mini_step_train: {total_tokens_per_mini_step_train}\n")
+        f.write(f"grad_accum_mini_steps: {grad_accum_mini_steps}\n")
+        f.write(f"total_tokens_per_step_val: {total_tokens_per_step_val}\n")
+        f.write(f"val_steps: {val_steps}\n")
+        f.write(f"max_train_steps: {max_train_steps}\n")
+        f.write(f"adamw_min_lr_after_lr_warmup: {adamw_min_lr_after_lr_warmup}\n")
+        f.write(f"lr_warmup_steps: {lr_warmup_steps}\n")
+        f.write(f"lr_warmup_and_cosine_steps: {lr_warmup_and_cosine_steps}\n")
+        f.write(f"min_lr_after_warmup: {min_lr_after_warmup}\n")
 
-        # derived
-        f.write(f"max steps: {max_steps}\n")
-        f.write(f"min lr after warmup: {min_lr_after_warmup}\n")
-        f.write(f"warmup steps: {warmup_steps}\n")
-        f.write(f"warmup and cosine steps: {warmup_and_cosine_steps}\n")
+        f.write("\n################")
+        f.write("\n# Model Config #")
+        f.write("\n################\n")
+        for k, v in gpt_config.__dict__.items():
+             f.write(f"{k}: {v}\n")
 
-        f.write(f"base seed: {base_seed}\n")
-        f.write(f"device type: {device_type}\n")
-        f.write(f"tokenizer: gpt2 (tiktoken)\n")
-
-        f.write(f"val target: {val_target}\n")
-        f.write(f"val steps: {val_steps}\n")
-        f.write(f"val interval: {val_interval}\n")
-        f.write(f"sample interval: {sample_interval}\n")
-        f.write(f"train val margin: {train_val_margin}\n")
-
-        for k, v in model_cfg.__dict__.items():
-            f.write(f"model config - {k}: {v}\n")
+    print(f"training and model configs saved to {config_filename}")
 
 if master_process:
     save_config_info()
@@ -2067,17 +3062,191 @@ if master_process:
 ################################################
 #              Parameter Logging               #
 ################################################
-# 50304*768 + 1024*768 + 12*2*(768+768) + 12*(768*3*768 + 3*768) + 12*(768*768 + 768) + 12*(768*4*768 + 4*768) + 12*(768*4*768 + 768) + 768 + 768
 if master_process:
     message = f"{sum(p.numel() for p in gpt_model.parameters() if p.requires_grad):,} parameters"
     print(message)
     log_buffer.append(message)
 
+################################################
+#                Kernel Warmup                 #
+################################################
+def _kernel_warmup(num_train_steps: int = 2) -> None:
+    # snapshot everything so we don't "cheat"
+    model_state = copy.deepcopy(raw_gpt_model.state_dict())
+    optimizer_states = {k: copy.deepcopy(opt.state_dict()) for k, opt in optimizers.items()}
+    rng_state_cpu = torch.get_rng_state()
+    rng_state_cuda = torch.cuda.get_rng_state()
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # train-shape warmup (compile both DDP graphs)
+    gpt_model.train()
+    with torch.enable_grad():
+        for _ in range(num_train_steps):
+            for optimizer in optimizers.values():
+                optimizer.zero_grad(set_to_none=True)
+
+            for mini_step in range(grad_accum_mini_steps):
+                # mimic the real training loop’s DDP behavior
+                gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
+
+                # make shapes match training
+                x_train = torch.randint(
+                    0, raw_gpt_model.pad_token_id,
+                    (gpu_batch_size_train, seq_len_train), device=device
+                )
+                y_train = torch.randint(
+                    0, raw_gpt_model.pad_token_id,
+                    (gpu_batch_size_train, seq_len_train), device=device
+                )
+
+                # synthesize doc_ids so the doc-masking + SWA FlexAttention path compiles
+                if raw_gpt_model.use_doc_masking:
+                    # set random-ish EOS boundaries
+                    step = max(16, seq_len_train // 8)
+                    idxs = torch.arange(seq_len_train, device=device)[None, :]
+                    rand_offsets = torch.randint(0, step, (gpu_batch_size_train, 1), device=device)
+                    is_eos = ((idxs + rand_offsets) % step == 0)
+                    doc_ids_train = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
+                else:
+                    doc_ids_train = None
+
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    _, warm_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+
+                (warm_loss / grad_accum_mini_steps).backward()
+
+            for optimizer in optimizers.values():
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # val-shape warmup (compile eval forward)
+    gpt_model.eval()
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        x_val = torch.randint(
+            0, raw_gpt_model.pad_token_id,
+            (gpu_batch_size_val, seq_len_val), device=device
+        )
+        y_val = torch.randint(
+            0, raw_gpt_model.pad_token_id,
+            (gpu_batch_size_val, seq_len_val), device=device
+        )
+        if raw_gpt_model.use_doc_masking:
+            step = max(16, seq_len_val // 8)
+            idxs = torch.arange(seq_len_val, device=device)[None, :]
+            rand_offsets = torch.randint(0, step, (gpu_batch_size_val, 1), device=device)
+            is_eos = ((idxs + rand_offsets) % step == 0)
+            doc_ids_val = torch.cumsum(is_eos.to(torch.int32), dim=1) - is_eos.to(torch.int32)
+        else:
+            doc_ids_val = None
+
+        _ = gpt_model(x_val, y_val, document_ids=doc_ids_val)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # sampling-shape warmup
+    raw_gpt_model.eval()
+    max_new_tokens = get_sample_token_count(start_step)
+    max_allowed_input_len = raw_gpt_model.max_seq_len - max_new_tokens
+    initial_input_ids_list = [
+        tokenizer.encode(sequence)[:max_allowed_input_len] 
+        for sequence in sample_sequences
+    ]
+    max_input_len = max(1, max(len(ids) for ids in initial_input_ids_list))
+    alloc_len = max_input_len + max_new_tokens
+    round_multiple = raw_gpt_model.flex_block_size if raw_gpt_model.use_flex_attention else 8
+    alloc_len = min(raw_gpt_model.max_seq_len, math.ceil(alloc_len / round_multiple) * round_multiple)
+
+    sampling_input_ids = torch.full(
+        (len(sample_sequences), alloc_len),
+        raw_gpt_model.pad_token_id,
+        dtype=torch.long,
+        device=device
+    )
+    for i, ids in enumerate(initial_input_ids_list):
+        if ids:
+            sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+        _ = eager_gpt_model(
+            sampling_input_ids,
+            attn_mask=None,
+            ignore_doc_mask=True,
+            document_ids=None,
+        )
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # hellaswag-shape warmup
+    raw_gpt_model.eval()
+    hellaswag_examples_per_batch = 16
+    max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
+
+    alloc_len = min(1024, raw_gpt_model.max_seq_len)
+
+    pre_allocated_input_ids = torch.full(
+        (max_gpu_sequences_per_batch, alloc_len),
+        raw_gpt_model.pad_token_id,
+        dtype=torch.long,
+        device=device
+    )
+
+    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        _ = raw_gpt_model(
+            pre_allocated_input_ids,
+            attn_mask=None,
+            ignore_doc_mask=True,
+            document_ids=None,
+        )
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+    # restore state
+    raw_gpt_model.load_state_dict(model_state)
+    for k, optimizer in optimizers.items():
+        optimizer.load_state_dict(optimizer_states[k])
+    torch.set_rng_state(rng_state_cpu)
+    torch.cuda.set_rng_state(rng_state_cuda)
+
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+
+_kernel_warmup(num_train_steps=kernel_warmup_train_steps)
+
 ##################################################################
 #  Training, Validation, Sampling, HellaSwag, Checkpointing loop #
 ##################################################################
 try:
-    for step in range(start_step, max_steps):
+    if raw_gpt_model.use_sliding_window_size_ramp:
+        use_sliding_window_size_ramp = raw_gpt_model.use_sliding_window_size_ramp
+        sliding_window_min_size = raw_gpt_model.sliding_window_min_size
+        sliding_window_max_size = raw_gpt_model.sliding_window_max_size
+        flex_block_size = raw_gpt_model.flex_block_size
+        enforce_even_blocks = raw_gpt_model.enforce_even_blocks
+        swa_ramp_start_step = raw_gpt_model.swa_ramp_start_step
+        swa_ramp_end_step = raw_gpt_model.swa_ramp_end_step
+        swa_window_coeff_m = raw_gpt_model.swa_window_coeff_m
+        swa_window_coeff_n = raw_gpt_model.swa_window_coeff_n
+        swa_step_coeff_m = raw_gpt_model.swa_step_coeff_m
+        swa_step_coeff_n = raw_gpt_model.swa_step_coeff_n
+        current_window_size = raw_gpt_model.initial_sliding_window_size
+        next_update_step = 0
+
+    for step in range(start_step, max_train_steps):
         
         torch.cuda.synchronize()
         start_train_t = time.time()
@@ -2137,15 +3306,38 @@ try:
         #         f"{float(grad_norm_pre_clipping):.4f} pre-"
         # )
         # <-- Uncomment for gradient norm clipping -->
-        
-        lr = get_lr(step)
-        # AdamW gets the base lr
+
+        # update lr  
+        adamw_lr = get_adamw_lr(step)
+
+        # update SWA window size (if SWA ramp up)
+        if use_sliding_window_size_ramp:
+            current_window_size, next_update_step = get_sliding_window_size(
+                step=step,
+                use_sliding_window_size_ramp = use_sliding_window_size_ramp,
+                sliding_window_min_size=sliding_window_min_size,
+                sliding_window_max_size=sliding_window_max_size,
+                flex_block_size=flex_block_size,
+                enforce_even_blocks=enforce_even_blocks,
+                swa_ramp_start_step=swa_ramp_start_step,
+                swa_ramp_end_step=swa_ramp_end_step,
+                swa_window_coeff_m=swa_window_coeff_m,
+                swa_window_coeff_n=swa_window_coeff_n,
+                swa_step_coeff_m=swa_step_coeff_m,
+                swa_step_coeff_n=swa_step_coeff_n,
+                current_window_size=current_window_size,
+                next_update_step=next_update_step
+            )
+            # update the buffer in-place to avoid graph breaks
+            raw_gpt_model.sliding_window_size.fill_(current_window_size)
+
+        # AdamW gets the base learning rate
         for param_group in optimizers["adamw"].param_groups:
-            param_group['lr'] = lr
-        # Muon if present gets scaled lr
+            param_group['lr'] = adamw_lr
+        # Muon if present gets scaled learning rate
         if "muon" in optimizers:
             for param_group in optimizers["muon"].param_groups:
-                param_group['lr'] = lr * raw_gpt_model.muon_lr_scale
+                param_group['lr'] = adamw_lr * raw_gpt_model.muon_lr_scale
         # Step present optimizers
         for optimizer in optimizers.values():
             optimizer.step()
@@ -2176,17 +3368,25 @@ try:
             # <-- Uncomment for logit soft-capping -->
             # the scale is constant across ranks because it is head-dependant, and all
             # gpus share the heads (even though with different data)
+            sw_size_suffix = ""
+            if raw_gpt_model.use_sliding_window_attention:
+                sw_size_suffix = f"sw size: {raw_gpt_model.sliding_window_size}"
             qk_suffix = ""
             if raw_gpt_model.use_qk_norm and raw_gpt_model.use_qk_debug_log:
-                qk_suffix = " | " + qk_scale_debug_string(raw_gpt_model)
+                qk_suffix = qk_scale_debug_string(raw_gpt_model)
+
             train_tokens_processed += (grad_accum_mini_steps * total_tokens_per_mini_step_train)
             train_log_content = (
-                f"step: {step:,} | train loss: {tl:.8f} | "
+                f"step: {step:,} | "
+                f"train loss: {tl:.8f} | "
                 f"train ppl: {math.exp(tl):,.2f} | "
                 f"train step time: {1000*(train_step_t):,.2f} ms | "
-                # f"grad norm: {grad_norm_text} | lr: {lr:.8f} | "
+                # f"grad norm: {grad_norm_text} | "
+                f"adamw lr: {adamw_lr:.8f} | "
                 f"tok/s: {total_tokens_per_step_train / train_step_t:,.2f} | "
-                f"total toks: {train_tokens_processed:,} | total time: {total_t/60:,.2f} min"
+                f"total toks: {train_tokens_processed:,} | "
+                f"total time: {total_t/60:,.2f} min | "
+                f"{sw_size_suffix} | "
                 f"{qk_suffix}"
                 # f"{logits_suffix}"
             )
@@ -2195,7 +3395,7 @@ try:
             #     f.write(train_log_content + "\n")
             log_buffer.append(train_log_content)
 
-        if (step % sample_interval == 0 and step > 0) or step == max_steps - 1:
+        if (step % sample_interval == 0 and step > 0) or step == max_train_steps - 1:
             torch.cuda.synchronize()
             start_sample_t = time.time()
             max_new_tokens = get_sample_token_count(step)
@@ -2210,7 +3410,7 @@ try:
                 print(message)
                 log_buffer.append(message)
 
-        if (step % hellaswag_interval == 0 and step > 0) or step == max_steps - 1:
+        if (step % hellaswag_interval == 0 and step > 0) or step == max_train_steps - 1:
             torch.cuda.synchronize()
             start_hellaswag_t = time.time()
             accuracy = evaluate_hellaswag_standard()
@@ -2232,7 +3432,7 @@ try:
                 print(message)
                 log_buffer.append(message)
         
-        if (allow_val and (step % val_interval == 0 and step > 0)) or step == max_steps - 1:
+        if (allow_val and (step % val_interval == 0 and step > 0)) or step == max_train_steps - 1:
             torch.cuda.synchronize()
             start_val_t = time.time()
             gpt_model.eval()

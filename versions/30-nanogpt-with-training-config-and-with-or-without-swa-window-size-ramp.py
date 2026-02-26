@@ -23,7 +23,7 @@ from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_
 from typing import Optional, Tuple, List, Dict, Any, Callable, Iterable, Sequence, Union
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 30-nanogpt-with-training-config-and-with-or-without-swa-window-size-ramp.py
+# torchrun --standalone --nproc_per_node=4 versions/30-nanogpt-with-training-config-and-with-or-without-swa-window-size-ramp.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -385,14 +385,14 @@ def apply_rotation(
 #   build an SGD+momentum update g, then REPLACE it with its nearest orthogonal
 #   matrix (orthogonalization), and apply that as the step. This helps keep layers
 #   well-conditioned and discourages rank collapse.
- # ---------
+# ---------
 # Muon vs AdamW:
 #   Muon uses SGD + momentum to form g, then orthogonalizes g (via the backend) and scales it.
 #   Use Muon for 2D block weights (e.g., transformer.h.*.weight).
 #   Keep embeddings, layer norms, biases, and the final lm_head on AdamW.
 #   Train these disjoint  param sets with their respective optimizers in parallel.
 #   To use it with 4D convolutional filters, flatten the last 3 dimensions.
- # ---------
+# ---------
 # The backend is simply the algorithm used to orthogonalize the 2D update matrix. Two choices are:
 #   svd:
 #       Exact, via SVD. If G = U S V^T, the projection of G (in Frobenius norm) onto the Stiefel
@@ -1696,7 +1696,8 @@ def sample(
                 # and predict, resulting in (len(sample_sequences), seq_len, vocab_size)
                 # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
                 # so we can skip passing an attn_mask
-                logits, _ = raw_gpt_model(generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
+                eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+                logits, _ = eager_gpt_model(generated_sequences, attn_mask=None, ignore_doc_mask=True, document_ids=None)
             
             # of which we take the vocab_size values for each sequence's continuation to the last non-pad token,
             # resulting in len(sample_sequences), vocab_size
@@ -2393,13 +2394,14 @@ def load_checkpoint() -> Tuple[
 ################################################
 #      Initialization & Non-Model Config       #
 ################################################
-init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
 device_type = "cuda"
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
+# init_process_group(backend='nccl', device_id=ddp_local_rank)
+init_process_group(backend='nccl')
 master_process = ddp_rank == 0
 
 training_config = TrainingConfig()
@@ -2786,7 +2788,8 @@ def _kernel_warmup(num_train_steps: int = 2) -> None:
             sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
 
     with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        _ = raw_gpt_model(
+        eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+        _ = eager_gpt_model(
             sampling_input_ids,
             attn_mask=None,
             ignore_doc_mask=True,
