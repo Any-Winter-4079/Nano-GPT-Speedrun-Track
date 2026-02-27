@@ -7,11 +7,11 @@ from huggingface_hub import delete_repo, create_repo, upload_folder
 # the current checkpoints (on the Hub) elsewhere before overwriting
 # the HF repo, or even add the local checkpoints to the Hub without 
 # deleting old ones if we skip calling the delete_repo function
-timestamp = "20251013_145053"
+timestamp = "20260211_180749"
 config_and_log_dir = f"./configs_and_logs/{timestamp}"
 hf_user = os.environ.get("hf_user")
 hf_token = os.environ.get("hf_token")
-hub_repo_id = f"{hf_user}/gpt-3-small_{timestamp}"
+hub_repo_id = f"{hf_user}/nanogpt_{timestamp}"
 checkpoint_dir = f"./checkpoints/{timestamp}"
 
 def push_to_hub():
