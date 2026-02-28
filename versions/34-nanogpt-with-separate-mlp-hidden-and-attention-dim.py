@@ -28,7 +28,7 @@ from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_
 from typing import Optional, Tuple, List, Dict, Any, Callable, Iterable, Sequence, Union
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 versions/33-nanogpt-with-token-based-schedules-weighted-paths-varying-precision-and-compilation_modes.py
+# torchrun --standalone --nproc_per_node=4 versions/34-nanogpt-with-separate-mlp-hidden-and-attention-dim.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
@@ -43,8 +43,9 @@ class GPTConfig:
     # miscellaneous
     n_layers: int = 8
     d_model: int = 1024
+    attn_dim: int = 1024
     use_bias: bool = False
-    up_proj_factor: int = 2
+    mlp_hidden_dim: int = 2048
     use_tied_embeddings: bool = True
     norm_type: str = "rms" # "rms" or any other name for "layer"
     is_causal: bool = True # True for decoders or False for encoders
@@ -71,9 +72,10 @@ class GPTConfig:
     # n_heads > n_kv_heads > 1 for GQA (Grouped-Query Attention) 
     # and n_kv_heads == 1      for MQA  (Multi-Query Attention)
     # NOTE: increasing n_heads (fixing n_kv_heads) reduces the parameters for GQA/MQA
-    # q_proj: (d_model → n_heads * head_size)
+    # q_proj: (d_model → attn_dim)
     # k_proj: (d_model → n_kv_heads * head_size)
-    # when d_model is split, the more (q) heads, the smaller the head_size, which is reused for k, v
+    # when attn_dim is split, the more (q) heads, the smaller the head_size, which is reused for k, v
+    # head_size ~128 looks good
     n_heads: int = 16
     n_kv_heads: int = 16
     use_flex_attention: bool = True # True for FlexAttention or False for SDPA
@@ -258,7 +260,7 @@ class TrainingConfig:
     run_benchmarks: bool = False
 
     # seeding: 133, 1337
-    base_seed: int = 1337
+    base_seed: int = 133
 
     # kernel warmup
     kernel_warmup_train_steps: int = 2
@@ -1272,19 +1274,20 @@ def qk_scale_debug_string(model: "GPT") -> str:
 class SelfAttention(nn.Module):
     def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig) -> None:
         super().__init__()
-        
-        assert gpt_config.d_model % gpt_config.n_heads == 0
+
         self.d_model = gpt_config.d_model
+        self.attn_dim = gpt_config.attn_dim
         self.n_heads = gpt_config.n_heads
         self.n_kv_heads = gpt_config.n_kv_heads
         assert 1 <= self.n_kv_heads <= self.n_heads, "n_kv_heads must be in [1, n_heads]"
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads for GQA/MQA"
-        self.head_size = gpt_config.d_model // gpt_config.n_heads
+        assert self.attn_dim % self.n_heads == 0, "attn_dim must be divisible by n_heads"
+        self.head_size = self.attn_dim // self.n_heads
         self.q_heads_per_kv_head = self.n_heads // self.n_kv_heads
-        self.q_proj = nn.Linear(gpt_config.d_model, self.n_heads * self.head_size, bias=gpt_config.use_bias)
+        self.q_proj = nn.Linear(gpt_config.d_model, self.attn_dim, bias=gpt_config.use_bias)
         self.k_proj = nn.Linear(gpt_config.d_model, self.n_kv_heads * self.head_size, bias=gpt_config.use_bias)
         self.v_proj = nn.Linear(gpt_config.d_model, self.n_kv_heads * self.head_size, bias=gpt_config.use_bias)
-        self.c_proj = nn.Linear(gpt_config.d_model, gpt_config.d_model, bias=gpt_config.use_bias)
+        self.c_proj = nn.Linear(self.attn_dim, gpt_config.d_model, bias=gpt_config.use_bias)
         
         self.rotary = Rotary(self.head_size, gpt_config.rope_base_theta, training_config.max_seq_len) if gpt_config.pos_encoding_type.lower() == "rope" else None
         
@@ -1341,7 +1344,7 @@ class SelfAttention(nn.Module):
             flex_attn_block_mask: Optional[BlockMask] = None,
             sdpa_attn_mask: Optional[Tensor] = None,
             ) -> Tensor:
-        _, seq_len, d_model = x.size()
+        _, seq_len, _ = x.size()
 
         # cast if no autocast and cast is requested (x input can be f32, and q_proj / k_proj / v_proj weights can be bf16)
         if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.q_proj.weight.dtype:
@@ -1406,7 +1409,7 @@ class SelfAttention(nn.Module):
             is_causal = self.is_causal and (sdpa_attn_mask is None)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=sdpa_attn_mask, is_causal=is_causal)
 
-        y = y.transpose(1, 2).contiguous().view(x.size(0), seq_len, d_model)
+        y = y.transpose(1, 2).contiguous().view(x.size(0), seq_len, self.attn_dim)
         # cast if no autocast and cast is requested (y coming from attention can be fp32, proj weights can be bf16)
         if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and y.dtype != self.c_proj.weight.dtype:
             y = y.to(dtype=self.c_proj.weight.dtype)
@@ -1425,24 +1428,24 @@ class MLP(nn.Module):
 
         if self.activation_name == "swiglu":
             # without gating:
-            # the up projection is (d_model, up_proj_factor * d_model) with -if used- up_proj_factor * d_model biases
-            # the down projection is (up_proj_factor * d_model, d_model) with -if used- d_model biases
+            # the up projection is (d_model, mlp_hidden_dim) with -if used- mlp_hidden_dim biases
+            # the down projection is (mlp_hidden_dim, d_model) with -if used- d_model biases
             # with gating:
             # the first matrix needs to start as d_model -i.e., (d_model, X)- 
             # and the last matrix end as d_model -i.e., (X, d_model)
             # we also need to match X (dimension) in both matrices for @
             # and split the output of the first matrix in X/2 -i.e., (d_model, X/2)- for gating
-            # so the 2 up_proj_factor * d_model dimensions without gating need to be split 
-            # for gating into 3 of size 2 / 3 * up_proj_factor * d_model, resulting in:
-            # 2 up projection matrices of size (d_model, 2 / 3 * up_proj_factor * d_model) each, with -if used- 2 * 2 / 3 * up_proj_factor * d_model total biases
-            # 1 down projection of size (2 / 3 * up_proj_factor * d_model, d_model) with -if used- d_model biases
+            # so the 2 * mlp_hidden_dim dimensions without gating need to be split
+            # for gating into 3 of size 2 / 3 * mlp_hidden_dim, resulting in:
+            # 2 up projection matrices of size (d_model, 2 / 3 * mlp_hidden_dim) each, with -if used- 2 * 2 / 3 * mlp_hidden_dim total biases
+            # 1 down projection of size (2 / 3 * mlp_hidden_dim, d_model) with -if used- d_model biases
             # the total number of weight parameters matches, but, if used, biases -slightly- differ as
-            # up_proj_factor * d_model + d_model != 2 * 2 / 3 * up_proj_factor * d_model + d_model
-            self.hidden_dim = round((2.0/3.0) * gpt_config.up_proj_factor * gpt_config.d_model) if gpt_config.use_fair_swiglu else gpt_config.up_proj_factor * gpt_config.d_model
+            # mlp_hidden_dim + d_model != 2 * 2 / 3 * mlp_hidden_dim + d_model
+            self.hidden_dim = round((2.0/3.0) * gpt_config.mlp_hidden_dim) if gpt_config.use_fair_swiglu else gpt_config.mlp_hidden_dim
             self.c_fc = nn.Linear(gpt_config.d_model, self.hidden_dim * 2, bias=gpt_config.use_bias)
             self.c_proj = nn.Linear(self.hidden_dim, gpt_config.d_model, bias=gpt_config.use_bias)
         else:
-            self.hidden_dim = gpt_config.up_proj_factor * gpt_config.d_model
+            self.hidden_dim = gpt_config.mlp_hidden_dim
             self.c_fc = nn.Linear(gpt_config.d_model, self.hidden_dim, bias=gpt_config.use_bias)
             self.c_proj = nn.Linear(self.hidden_dim, gpt_config.d_model, bias=gpt_config.use_bias)
 
