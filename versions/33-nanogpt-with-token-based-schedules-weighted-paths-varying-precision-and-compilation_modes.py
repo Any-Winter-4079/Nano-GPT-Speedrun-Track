@@ -1,5 +1,6 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import sys
 import copy
 import math
 import time
@@ -8,6 +9,7 @@ import triton
 import inspect
 import tiktoken
 import threading
+import contextlib
 import numpy as np
 import torch.nn as nn
 from torch import Tensor
@@ -26,11 +28,11 @@ from torch.nn.attention.flex_attention import flex_attention, BlockMask, create_
 from typing import Optional, Tuple, List, Dict, Any, Callable, Iterable, Sequence, Union
 # pip install tiktoken huggingface_hub safetensors
 
-# torchrun --standalone --nproc_per_node=4 versions/33-nanogpt-with-token-based-batch-size-lr-swa-schedules.py
+# torchrun --standalone --nproc_per_node=4 versions/33-nanogpt-with-token-based-schedules-weighted-paths-varying-precision-and-compilation_modes
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 
 ################################################
-# 4 x H100 SXM | 56 vCPU 503 GB RAM | $10.86/h # 
+# 4 x H100 SXM | 56 vCPU 503 GB RAM | $10.86/h #
 ################################################
 
 ################################################
@@ -46,6 +48,18 @@ class GPTConfig:
     use_tied_embeddings: bool = True
     norm_type: str = "rms" # "rms" or any other name for "layer"
     is_causal: bool = True # True for decoders or False for encoders
+
+    # residuals
+    # if x is the residual/skip path, we can weigh:
+    # - x, or the residual
+    # - Attn(norm(x)) and MLP(norm(x))
+    # Resulting in:
+    # x = alpha_1 * x + beta_1 * Attn(norm(x))
+    # x = alpha_2 * x + beta_2 * MLP(norm(x))
+    use_weighted_residual_path: bool = False
+    weighted_residual_path_init: float = 1.0 # alpha_1, alpha_2 init
+    use_weighted_main_path: bool = True
+    weighted_main_path_init: float = 0.0 # beta_1, beta_2 init
 
     # vocabulary and tokenizer
     vocab_size: int = 50304
@@ -112,6 +126,7 @@ class TrainingConfig:
     seq_len_train: int = 8192
     seq_len_val: int = 8192
     max_tokens: int = 5 * 10**9
+
     flex_block_size: int = 128
     enforce_even_blocks: bool = False # this *can* increase the window past its max to fit even block count
     # custom_schedule expects: "values", with a list of train_tokens_processed to increase the batch size at (e.g., after 10M, 25M, etc. tokens processed)
@@ -120,7 +135,7 @@ class TrainingConfig:
     batch_size_keys_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [0, 52_428_800], # in train_tokens_processed
+            "values": [0], # in train_tokens_processed
             # "start": 2_457_600,
             # "factor": 2, # in train_tokens_processed
             # "count": 4,
@@ -132,7 +147,7 @@ class TrainingConfig:
     batch_size_values_schedule: Dict[str, Any] = field(default_factory=lambda: {
         "fn": custom_schedule,
         "kwargs": {
-            "values": [4, 8], # in batch size
+            "values": [8], # in batch size
         },
     })
 
@@ -189,6 +204,8 @@ class TrainingConfig:
     muon_use_nesterov: bool = True
     # derived from the above
     total_decay_tokens: int = lr_warmup_and_cosine_tokens - lr_warmup_tokens
+    # filled by resolve
+    lr_schedule: List[Dict[str, Any]] = field(default_factory=list)
 
     # loading/checkpointing
     checkpoint_interval: int = 1000
@@ -212,6 +229,9 @@ class TrainingConfig:
     # dataloader
     data_path: str = "./data/edu_fineweb10B"
 
+    # data
+    data_uses_padding: bool = False
+
     # validation
     val_target: float = 3.28
     val_tokens: int = 5 * 2**21 # 5 * 2**21 == 10_485_760
@@ -221,6 +241,7 @@ class TrainingConfig:
 
     # sampling
     sample_interval: int = 4000
+    run_sampling: bool = False
     sample_sequences: List[str] = field(default_factory=lambda:[
         "The universe has always been",
         "Who am I? I am a language model",
@@ -234,12 +255,46 @@ class TrainingConfig:
 
     # hellaswag
     hellaswag_interval: int = 4000
+    run_benchmarks: bool = False
 
-    # seeding
-    base_seed: int = 1337
+    # seeding: 133, 1337
+    base_seed: int = 133
 
     # kernel warmup
     kernel_warmup_train_steps: int = 2
+
+    # torch compile
+    torch_compile_mode: str = "max-autotune" # "max-autotune" | "reduce-overhead" | "max-autotune-no-cudagraphs" | "default"
+    torch_compile_fullgraph: bool = True
+    torch_compile_dynamic: bool = False
+
+    # torch._inductor.config.cpp_wrapper = True
+
+    # precision
+    # upon initialization, weights are fp32; we can cast them to bf16 with .bfloat16()
+    # torch.autocast(..., dtype=torch.bfloat16) does not change weight datatypes; it
+    # (momentarily) casts (for operations eligible to run in bf16) the operands to bf16, e.g.
+    # - the input/previous activation
+    # - the weight matrix
+    # therefore the output being bf16
+    # However, with autocast alone, fp32 weights are still read from memory using 4 bytes, and only some operations are eligible
+    # set_float32_matmul_precision applies if operands are fp32
+    # - highest -> perform matmul in fp32 (24 mantissa bits with 23 bits explicitly stored)
+    # - high -> perform matmul either in tf32 or treat fp32 as the sum of 2 bf16 numbers
+    # - medium -> perform matmul in bf16 (8 mantissa bits with 7 bits explicitly stored)
+    # Source: https://docs.pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    keep_fp32_loss: bool = True
+    use_all_bf16_and_null_ctx: bool = False # all (1d/2d) weights, nn.Parameter, scales to bf16, and no autocast (nullcontext)
+    use_bf16_weights_params_or_scales: bool = False # some (1d/2d) weights, nn.Parameter, or scales to bf16 (can be overwritten/ignored if use_all_bf16_and_null_ctx=True -which casts all-)
+    bf16_weights_params_and_scales: Dict[str, Any] = field(default_factory=lambda: {
+        "nn.Linear": nn.Linear,
+        "nn.Embedding": nn.Embedding,
+        #"nn.Parameter": nn.Parameter
+    }) # which (1d/2d) weights, (learnable) nn.Parameter, or (nn.Parameter with requires_grad=False as) scale to cast to bf16 if use_bf16_weights_params_or_scales=True (can be overwritten to {"all": object} if use_all_bf16_and_null_ctx=True -which casts all-)
+    float32_matmul_precision: str = "high" # "highest" | "high" | "medium" (ignored if no fp32 operands or if they are eligible by autocast to run in bf16)
+    use_bf16_autocast: bool = True # autocast eligible inputs/weights (momentarily) to bf16 (can be overwritten/ignored if use_all_bf16_and_null_ctx=True -which uses null context-)
+    keep_1d_weights_params_and_scales_in_fp32: bool = False # keep 1d weights, nn.Parameter, and scales in fp32 overwriting bf16_weights_params_and_scales={...} or use_all_bf16_and_null_ctx=True
+    cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast: bool = False # match 1d weights, learnable nn.Parameter, and scales data type (e.g., fp32) to that of other operands (e.g., bf16 for 2d weights), applicable when use_bf16_autocast=False
 
     # filled by resolve(ddp_world_size)
     # steps and tokens
@@ -249,6 +304,11 @@ class TrainingConfig:
     val_steps: int = field(init=False)
 
     def resolve(self, ddp_world_size: int) -> None:
+        # bf16
+        if self.use_all_bf16_and_null_ctx:
+            self.use_bf16_autocast = False
+            self.bf16_weights_params_and_scales = {"all": object}
+
         # Muon Polar Express
         if self.optimizer_type == "muon" and self.muon_backend == "polarexpress":
             assert self.muon_backend_steps == 5, (
@@ -304,6 +364,24 @@ class TrainingConfig:
         ]
         self.swa_initial_window_size = self.swa_schedule_values[0]
         self.swa_final_window_size = self.swa_schedule_values[-1]
+
+        # lr schedule (token ranges map to functions; functions take tokens since range start)
+        # get_token_based_adamw_lr expects: lr_warmup_tokens, lr_warmup_and_cosine_tokens, total_decay_tokens,
+        # adamw_max_lr, adamw_hard_min_lr
+        self.lr_schedule = [
+            {
+                "start": 0,
+                "end": self.max_tokens,
+                "fn": get_token_based_adamw_lr,
+                "kwargs": {
+                    "lr_warmup_tokens": self.lr_warmup_tokens,
+                    "lr_warmup_and_cosine_tokens": self.lr_warmup_and_cosine_tokens,
+                    "total_decay_tokens": self.total_decay_tokens,
+                    "adamw_max_lr": self.adamw_max_lr,
+                    "adamw_hard_min_lr": self.adamw_hard_min_lr,
+                },
+            },
+        ]
 
 ################################################
 #            Fast tanh Soft Capping            #
@@ -1205,6 +1283,10 @@ class SelfAttention(nn.Module):
         self.qk_norm_type = gpt_config.qk_norm_type
         self.qk_scale_max = gpt_config.qk_scale_max
         self.qk_eps = gpt_config.qk_eps
+
+        self.use_bf16_autocast = training_config.use_bf16_autocast
+        self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
+
         if self.use_qk_norm:
             # q_scale and k_scale are learned per-head scalars, like LayerNorm’s γ, that let 
             # the model adjust magnitude after normalization
@@ -1251,6 +1333,10 @@ class SelfAttention(nn.Module):
             sdpa_attn_mask: Optional[Tensor] = None,
             ) -> Tensor:
         _, seq_len, d_model = x.size()
+
+        # cast if no autocast and cast is requested (x input can be f32, and q_proj / k_proj / v_proj weights can be bf16)
+        if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.q_proj.weight.dtype:
+            x = x.to(dtype=self.q_proj.weight.dtype)
 
         q = self.q_proj(x).view(x.size(0), seq_len, self.n_heads, self.head_size).transpose(1, 2)
         k = self.k_proj(x).view(x.size(0), seq_len, self.n_kv_heads, self.head_size).transpose(1, 2)
@@ -1312,6 +1398,9 @@ class SelfAttention(nn.Module):
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=sdpa_attn_mask, is_causal=is_causal)
 
         y = y.transpose(1, 2).contiguous().view(x.size(0), seq_len, d_model)
+        # cast if no autocast and cast is requested (y coming from attention can be fp32, proj weights can be bf16)
+        if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and y.dtype != self.c_proj.weight.dtype:
+            y = y.to(dtype=self.c_proj.weight.dtype)
         y = self.c_proj(y)
         return y
 
@@ -1319,9 +1408,11 @@ class SelfAttention(nn.Module):
 #                     MLP                      #
 ################################################
 class MLP(nn.Module):
-    def __init__(self, gpt_config: GPTConfig) -> None:
+    def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig) -> None:
         super().__init__()
         self.activation_name = gpt_config.activation.lower()
+        self.use_bf16_autocast = training_config.use_bf16_autocast
+        self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
 
         if self.activation_name == "swiglu":
             # without gating:
@@ -1347,6 +1438,9 @@ class MLP(nn.Module):
             self.c_proj = nn.Linear(self.hidden_dim, gpt_config.d_model, bias=gpt_config.use_bias)
 
     def forward(self, x: Tensor) -> Tensor:
+        # cast if no autocast and cast is requested (x input can be f32, and c_fc weights can be bf16)
+        if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.c_fc.weight.dtype:
+            x = x.to(dtype=self.c_fc.weight.dtype)
         # Gaussian Error Linear Unit
         if self.activation_name == "gelu":
             x = F.gelu(self.c_fc(x))
@@ -1366,6 +1460,9 @@ class MLP(nn.Module):
             x = F.silu(x1) * x2
         else:
             raise ValueError(f"unsupported activation function: {self.activation_name}")
+        # cast if no autocast and cast is requested (x coming from activation can be fp32, proj weights can be bf16)
+        if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.c_proj.weight.dtype:
+            x = x.to(dtype=self.c_proj.weight.dtype)
         return self.c_proj(x)
 
 ################################################
@@ -1374,7 +1471,22 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, gpt_config: GPTConfig, training_config: TrainingConfig) -> None:
         super().__init__()
-        self.residual_scale = (2 * gpt_config.n_layers) ** -0.5
+        self.use_bf16_autocast = training_config.use_bf16_autocast
+        self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
+
+        self.use_weighted_residual_path = gpt_config.use_weighted_residual_path
+        self.use_weighted_main_path = gpt_config.use_weighted_main_path
+
+        if self.use_weighted_residual_path:
+            self.attn_residual_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_residual_path_init))
+            self.mlp_residual_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_residual_path_init))
+        
+        if self.use_weighted_main_path:
+            self.attn_main_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_main_path_init))
+            self.mlp_main_scale = nn.Parameter(torch.full((1,), gpt_config.weighted_main_path_init))
+        
+        if (not self.use_weighted_residual_path) and (not self.use_weighted_main_path):
+            self.residual_scale = nn.Parameter(torch.full((1,), (2 * gpt_config.n_layers) ** -0.5), requires_grad=False)
 
         if gpt_config.norm_type.lower() == "rms":
             self.ln_1 = nn.RMSNorm(gpt_config.d_model)
@@ -1385,7 +1497,7 @@ class Block(nn.Module):
             self.ln_2 = nn.RMSNorm(gpt_config.d_model)
         else:
             self.ln_2 = nn.LayerNorm(gpt_config.d_model)
-        self.mlp = MLP(gpt_config)
+        self.mlp = MLP(gpt_config, training_config)
 
     def forward(
             self,
@@ -1393,8 +1505,52 @@ class Block(nn.Module):
             flex_attn_block_mask: Optional[BlockMask] = None,
             sdpa_attn_mask: Optional[Tensor] = None,
             ) -> Tensor:
-        x = x + self.residual_scale * self.attn(self.ln_1(x), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
-        x = x + self.residual_scale * self.mlp(self.ln_2(x))
+        # weighted path
+        if self.use_weighted_residual_path or self.use_weighted_main_path:
+            # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+            x_ln1 = x
+            if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln1.dtype != self.ln_1.weight.dtype:
+                x_ln1 = x_ln1.to(dtype=self.ln_1.weight.dtype)
+
+            # Attention
+            if self.use_weighted_residual_path and not self.use_weighted_main_path:
+                # x = alpha_1 * x + Attn(norm(x))
+                x = self.attn_residual_scale * x + self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+            elif not self.use_weighted_residual_path and self.use_weighted_main_path:
+                # x = x + beta_1 * Attn(norm(x))
+                x = x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+            else:
+                # x = alpha_1 * x + beta_1 * Attn(norm(x))
+                x = self.attn_residual_scale * x + self.attn_main_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+
+            # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+            x_ln2 = x
+            if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+                x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
+
+            # MLP
+            if self.use_weighted_residual_path and not self.use_weighted_main_path:
+                # x = alpha_2 * x + MLP(norm(x))
+                x = self.mlp_residual_scale * x + self.mlp(self.ln_2(x_ln2))
+            elif not self.use_weighted_residual_path and self.use_weighted_main_path:
+                # x = x + beta_2 * MLP(norm(x))
+                x = x + self.mlp_main_scale * self.mlp(self.ln_2(x_ln2))
+            else:
+                # x = alpha_2 * x + beta_2 * MLP(norm(x))
+                x = self.mlp_residual_scale * x + self.mlp_main_scale * self.mlp(self.ln_2(x_ln2))
+
+        # standard path
+        else:
+            # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+            x_ln1 = x
+            if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln1.dtype != self.ln_1.weight.dtype:
+                x_ln1 = x_ln1.to(dtype=self.ln_1.weight.dtype)
+            x = x + self.residual_scale * self.attn(self.ln_1(x_ln1), flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
+            # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+            x_ln2 = x
+            if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln2.dtype != self.ln_2.weight.dtype:
+                x_ln2 = x_ln2.to(dtype=self.ln_2.weight.dtype)
+            x = x + self.residual_scale * self.mlp(self.ln_2(x_ln2))
         return x
 
 ################################################
@@ -1437,6 +1593,11 @@ class GPT(nn.Module):
 
         self.use_attn_logit_softcapping = gpt_config.use_attn_logit_softcapping
         self.attn_logit_softcap = gpt_config.attn_logit_softcap
+
+        self.use_bf16_autocast = training_config.use_bf16_autocast
+        self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast = training_config.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast
+        self.data_uses_padding = training_config.data_uses_padding
+        self.keep_fp32_loss = training_config.keep_fp32_loss
 
         swa_min_window_size = min(training_config.swa_schedule_values)
         if (self.use_doc_masking or self.use_attn_logit_softcapping or swa_min_window_size < training_config.max_seq_len):
@@ -1486,19 +1647,33 @@ class GPT(nn.Module):
             adamw_weight_decay: float,
             device_type: str,
             ) -> Dict[str, torch.optim.Optimizer]:
+        # collect trainable params
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
-        # pick Muon params by name (2D weights, excluding embeddings and lm_head)
+        if master_process:
+            # log param dtypes (bf16/fp32)
+            bf16_params = [pn for pn, p in param_dict.items() if p.dtype == torch.bfloat16]
+            fp32_params = [pn for pn, p in param_dict.items() if p.dtype == torch.float32]
+            message = (
+                f"optimizer parameters:\n"
+                f"\tbfloat16 params: {len(bf16_params)} tensors{' (e.g., ' + bf16_params[0] + ')' if bf16_params else ''}\n"
+                f"\tfloat32 params: {len(fp32_params)} tensors{' (e.g., ' + fp32_params[0] + ')' if fp32_params else ''}"
+            )
+            print(message)
+            log_buffer.append(message)
+
+        # muon params: 2d weights, excluding embeddings and lm_head
         muon_param_names = set()
         if self.optimizer_type == "muon":
             for pn, p in param_dict.items():
                 if p.dim() == 2 and ("wte" not in pn) and ("lm_head" not in pn):
                     muon_param_names.add(pn)
 
-        # AdamW gets everything else, split by decay rule
+        # adamw gets everything else, split by decay rule
         decay_params = [p for n, p in param_dict.items() if (n not in muon_param_names) and (p.dim() >= 2)]
         nodecay_params = [p for n, p in param_dict.items() if (n not in muon_param_names) and (p.dim() < 2)]
+        # create param groups
         optim_groups = [
             {'params': decay_params, 'weight_decay': adamw_weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
@@ -1507,6 +1682,7 @@ class GPT(nn.Module):
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         if master_process:
+            # log parameter counts
             messages = [
                 f"num decayed parameter tensors (AdamW): {len(decay_params)}, with {num_decay_params:,} parameters",
                 f"num non-decayed parameter tensors (AdamW): {len(nodecay_params)}, with {num_nodecay_params:,} parameters",
@@ -1518,6 +1694,7 @@ class GPT(nn.Module):
                 print(message)
                 log_buffer.append(message)
 
+        # enable fused adamw on cuda when available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and "cuda" in device_type
         if master_process:
@@ -1525,13 +1702,14 @@ class GPT(nn.Module):
             print(message)
             log_buffer.append(message)
 
+        # initialize adamw
         adamw = torch.optim.AdamW(optim_groups, lr=lr, betas=adamw_betas, eps=adamw_eps, fused=use_fused)
 
         # if not using Muon, still return a dict for consistency with the training loop
         if self.optimizer_type != "muon":
             return {"adamw": adamw}
 
-        # build Muon over its selected params
+        # initialize muon over its selected params
         muon_params = [param_dict[n] for n in muon_param_names]
         muon = Muon(
             muon_params,
@@ -1965,17 +2143,28 @@ class GPT(nn.Module):
 
         for block in self.transformer.h:
             x = block(x, flex_attn_block_mask=flex_attn_block_mask, sdpa_attn_mask=sdpa_attn_mask)
-        x = self.transformer.ln_f(x)
+        # cast if no autocast and cast is requested (1D Norm can be fp32, x can be bf16)
+        x_ln_f = x
+        if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x_ln_f.dtype != self.transformer.ln_f.weight.dtype:
+            x_ln_f = x_ln_f.to(dtype=self.transformer.ln_f.weight.dtype)
+        x = self.transformer.ln_f(x_ln_f)
 
         # [gpu_batch_size, seq_len, vocab_size]
+        # cast if no autocast and cast is requested (x can be fp32, lm_head weights can be bf16)
+        if not self.use_bf16_autocast and self.cast_1d_weights_params_and_scales_to_weight_dtype_if_no_autocast and x.dtype != self.lm_head.weight.dtype:
+            x = x.to(dtype=self.lm_head.weight.dtype)
         logits = self.lm_head(x)
 
         if targets is not None:
-            loss_mask = (targets != self.pad_token_id)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
-            n_non_masked_tokens = loss_mask.sum()
-            sum_non_masked_loss_tokens = (loss * loss_mask.view(-1)).sum()
-            loss = sum_non_masked_loss_tokens / n_non_masked_tokens
+            logits_for_loss = logits.float() if self.keep_fp32_loss and logits.dtype != torch.float32 else logits
+            if self.data_uses_padding:
+                loss_mask = (targets != self.pad_token_id)
+                loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
+                n_non_masked_tokens = loss_mask.sum()
+                sum_non_masked_loss_tokens = (loss * loss_mask.view(-1)).sum()
+                loss = sum_non_masked_loss_tokens / n_non_masked_tokens
+            else:
+                loss = F.cross_entropy(logits_for_loss.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
         else:
             loss = None
 
@@ -2126,7 +2315,7 @@ def sample(
             # and unsqueeze(1) to add a new dimension of size 1 at the end to give size (len(sample_sequences), 1)
             # attn_mask = torch.arange(alloc_len, device=device).unsqueeze(0) < actual_sequence_lengths.unsqueeze(1)
             
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with ctx:
                 # and predict, resulting in (len(sample_sequences), seq_len, vocab_size)
                 # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
                 # so we can skip passing an attn_mask
@@ -2454,7 +2643,7 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch: int = 16) -> float
                 pre_allocated_input_ids[idx, :len(seq_ids)] = torch.tensor(seq_ids, dtype=torch.long, device=device)
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with ctx:
                 # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
                 # so we can skip passing an attn_mask
                 logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
@@ -2598,7 +2787,7 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch: int = 16) -> float
                 pre_allocated_input_ids[idx, :len(seq_ids)] = torch.tensor(seq_ids, dtype=torch.long, device=device)
                 pre_allocated_attn_mask[idx, :len(seq_ids)] = True
 
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with ctx:
                 # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
                 # so we can skip passing an attn_mask
                 logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
@@ -2835,6 +3024,7 @@ ddp_world_size = int(os.environ['WORLD_SIZE'])
 device_type = "cuda"
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
+# in torch 2.10 cuda 12.8,you can get rid of the warning with
 # init_process_group(backend='nccl', device_id=ddp_local_rank)
 init_process_group(backend='nccl')
 master_process = ddp_rank == 0
@@ -2866,6 +3056,7 @@ tokenizer = training_config.tokenizer
 adamw_betas = training_config.adamw_betas
 adamw_eps = training_config.adamw_eps
 adamw_max_lr = training_config.adamw_max_lr
+lr_schedule = training_config.lr_schedule
 lr_warmup_tokens = training_config.lr_warmup_tokens
 lr_warmup_and_cosine_tokens = training_config.lr_warmup_and_cosine_tokens
 adamw_weight_decay = training_config.adamw_weight_decay
@@ -2919,6 +3110,16 @@ kernel_warmup_train_steps = training_config.kernel_warmup_train_steps
 log_buffer = []
 
 if master_process:
+    log_buffer.append(f"python: {sys.version}")
+    log_buffer.append(f"torch: {torch.__version__}")
+    log_buffer.append(f"torch.cuda: {torch.version.cuda}")
+    log_buffer.append(f"triton: {triton.__version__}")
+    log_buffer.append("=" * 100)
+    with open(sys.argv[0], "r") as f:
+        log_buffer.append(f.read())
+    log_buffer.append("=" * 100)
+
+if master_process:
     message = f"per-gpu gradient accumulation mini-steps: {grad_accum_mini_steps}"
     print(message)
     log_buffer.append(message)
@@ -2928,7 +3129,7 @@ if master_process:
     print(message)
     log_buffer.append(message)
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision(training_config.float32_matmul_precision)
 
 if master_process:
     print(f"{val_tokens:,} val tokens to be consumed in {val_steps:,} steps ({total_tokens_per_step_val:,} tokens per val step)")
@@ -2958,6 +3159,43 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 
 ################################################
+#                     BF16                     #
+################################################
+def convert_to_bf16(
+        gpt_model: GPT,
+        bf16_weights_params_and_scales: Dict[str, Any],
+        keep_1d_weights_params_and_scales_in_fp32: bool
+        ) -> None:
+    # cast all (1d/2d) weights, (learnable) nn.Parameter, (frozen nn.Parameter as) scale
+    cast_all = ("all" in bf16_weights_params_and_scales) and (bf16_weights_params_and_scales["all"] is object)
+    if cast_all:
+        for p in gpt_model.parameters():
+            if p.is_floating_point() and p.dtype != torch.bfloat16:
+                p.data = p.data.to(torch.bfloat16)
+    # potentially cast some of (1d/2d) weights, (learnable) nn.Parameter, (frozen nn.Parameter as) scale
+    else:
+        target_classes = tuple(bf16_weights_params_and_scales.values())
+
+        # module classes (e.g., nn.Linear, nn.Embedding)
+        module_classes = tuple(cls for cls in target_classes if isinstance(cls, type) and issubclass(cls, nn.Module))
+        if module_classes:
+            for m in gpt_model.modules():
+                if isinstance(m, module_classes):
+                    m.bfloat16()
+
+        # nn.Parameter
+        if any(cls is nn.Parameter for cls in target_classes):
+            for p in gpt_model.parameters():
+                if p.is_floating_point() and p.dtype != torch.bfloat16:
+                    p.data = p.data.to(torch.bfloat16)
+
+    # revert excluded weights, params, scales (as nn.Parameters with requires_grad=False)
+    if keep_1d_weights_params_and_scales_in_fp32:
+        for p in gpt_model.parameters():
+            if p.dim() == 1 and p.dtype == torch.bfloat16:
+                p.data = p.data.float()
+
+################################################
 #           Model Building / Loading           #
 ################################################
 gpt_config = GPTConfig()
@@ -2977,8 +3215,19 @@ if resume_from_checkpoint:
     # move the downloaded gpt_model to device, compile it, set up DDP, and set raw_gpt_model to create the optimizer
     # based on the downloaded model
     gpt_model.to(device)
-    #gpt_model = torch.compile(gpt_model, mode="max-autotune", fullgraph=True, dynamic=False)
-    gpt_model = torch.compile(gpt_model)
+    # bf16
+    if training_config.use_all_bf16_and_null_ctx or training_config.use_bf16_weights_params_or_scales:
+        convert_to_bf16(
+            gpt_model,
+            training_config.bf16_weights_params_and_scales,
+            training_config.keep_1d_weights_params_and_scales_in_fp32
+        )
+    gpt_model = torch.compile(
+        gpt_model,
+        mode=training_config.torch_compile_mode,
+        fullgraph=training_config.torch_compile_fullgraph,
+        dynamic=training_config.torch_compile_dynamic
+    )
     gpt_model = DDP(gpt_model, device_ids=[ddp_local_rank])
     raw_gpt_model = gpt_model.module
     optimizers = raw_gpt_model.configure_optimizers(adamw_max_lr, adamw_betas, adamw_eps, adamw_weight_decay, device_type)
@@ -2995,11 +3244,32 @@ if resume_from_checkpoint:
 else:
     gpt_model = GPT(gpt_config, training_config)
     gpt_model.to(device)
-    #gpt_model = torch.compile(gpt_model, mode="max-autotune", fullgraph=True, dynamic=False)
-    gpt_model = torch.compile(gpt_model)
+    # bf16
+    if training_config.use_all_bf16_and_null_ctx or training_config.use_bf16_weights_params_or_scales:
+        convert_to_bf16(
+            gpt_model,
+            training_config.bf16_weights_params_and_scales,
+            training_config.keep_1d_weights_params_and_scales_in_fp32
+        )
+    gpt_model = torch.compile(
+        gpt_model,
+        mode=training_config.torch_compile_mode,
+        fullgraph=training_config.torch_compile_fullgraph,
+        dynamic=training_config.torch_compile_dynamic
+    )
     gpt_model = DDP(gpt_model, device_ids=[ddp_local_rank])
     raw_gpt_model = gpt_model.module
     optimizers = raw_gpt_model.configure_optimizers(adamw_max_lr, adamw_betas, adamw_eps, adamw_weight_decay, device_type)
+
+################################################
+#               Context Manager                #
+################################################
+if training_config.use_all_bf16_and_null_ctx or not training_config.use_bf16_autocast:
+    # no-op context manager
+    ctx = contextlib.nullcontext()
+else:
+    # standard Mixed Precision
+    ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16)
 
 ################################################
 #             DataLoader Building              #
@@ -3059,6 +3329,9 @@ def save_config_info() -> None:
                  continue
             elif config_field.name == 'tokenizer':
                  f.write(f"tokenizer: gpt2 (tiktoken)\n")
+            elif config_field.name == 'bf16_weights_params_and_scales':
+                 keys = list(training_config.bf16_weights_params_and_scales.keys())
+                 f.write(f"bf16_weights_params_and_scales: {keys}\n")
             elif config_field.init is False:
                  continue
             else:
@@ -3090,7 +3363,29 @@ if master_process:
 #              Parameter Logging               #
 ################################################
 if master_process:
-    message = f"{sum(p.numel() for p in gpt_model.parameters() if p.requires_grad):,} parameters"
+    total_params = sum(p.numel() for p in gpt_model.parameters() if p.requires_grad)
+    message = f"{total_params:,} parameters"
+    print(message)
+    log_buffer.append(message)
+
+    # active parameters per token (124M speedrun rule): each embedding table counts as d_model active params
+    emb_params = 0
+    emb_tables = 0
+    # token embedding
+    wte = raw_gpt_model.transformer.wte.weight
+    emb_params += wte.numel()
+    emb_tables += 1
+    # positional embedding (if absolute)
+    if hasattr(raw_gpt_model.transformer, "wpe"):
+        emb_params += raw_gpt_model.transformer.wpe.weight.numel()
+        emb_tables += 1
+    # lm_head counts only if untied
+    if not gpt_config.use_tied_embeddings:
+        emb_params += raw_gpt_model.lm_head.weight.numel()
+        emb_tables += 1
+
+    active_params = total_params - emb_params + emb_tables * gpt_config.d_model
+    message = f"active parameters per token: {active_params:,}"
     print(message)
     log_buffer.append(message)
 
@@ -3146,7 +3441,7 @@ def _kernel_warmup(num_train_steps: int = 2) -> None:
                     else:
                         doc_ids_train = None
 
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    with ctx:
                         _, warm_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
 
                     (warm_loss / grad_accum_mini_steps).backward()
@@ -3161,7 +3456,7 @@ def _kernel_warmup(num_train_steps: int = 2) -> None:
 
     # val-shape warmup (compile eval forward)
     gpt_model.eval()
-    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+    with torch.inference_mode():
         x_val = torch.randint(
             0, raw_gpt_model.pad_token_id,
             (gpu_batch_size_val, seq_len_val), device=device
@@ -3186,62 +3481,64 @@ def _kernel_warmup(num_train_steps: int = 2) -> None:
         dist.barrier()
 
     # sampling-shape warmup
-    raw_gpt_model.eval()
-    max_new_tokens = get_sample_token_count(start_step)
-    max_allowed_input_len = raw_gpt_model.max_seq_len - max_new_tokens
-    initial_input_ids_list = [
-        tokenizer.encode(sequence)[:max_allowed_input_len] 
-        for sequence in sample_sequences
-    ]
-    max_input_len = max(1, max(len(ids) for ids in initial_input_ids_list))
-    alloc_len = max_input_len + max_new_tokens
-    round_multiple = raw_gpt_model.flex_block_size if raw_gpt_model.use_flex_attention else 8
-    alloc_len = min(raw_gpt_model.max_seq_len, math.ceil(alloc_len / round_multiple) * round_multiple)
+    if training_config.run_sampling:
+        raw_gpt_model.eval()
+        max_new_tokens = get_sample_token_count(start_step)
+        max_allowed_input_len = raw_gpt_model.max_seq_len - max_new_tokens
+        initial_input_ids_list = [
+            tokenizer.encode(sequence)[:max_allowed_input_len] 
+            for sequence in sample_sequences
+        ]
+        max_input_len = max(1, max(len(ids) for ids in initial_input_ids_list))
+        alloc_len = max_input_len + max_new_tokens
+        round_multiple = raw_gpt_model.flex_block_size if raw_gpt_model.use_flex_attention else 8
+        alloc_len = min(raw_gpt_model.max_seq_len, math.ceil(alloc_len / round_multiple) * round_multiple)
 
-    sampling_input_ids = torch.full(
-        (len(sample_sequences), alloc_len),
-        raw_gpt_model.pad_token_id,
-        dtype=torch.long,
-        device=device
-    )
-    for i, ids in enumerate(initial_input_ids_list):
-        if ids:
-            sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-
-    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
-        _ = eager_gpt_model(
-            sampling_input_ids,
-            attn_mask=None,
-            ignore_doc_mask=True,
-            document_ids=None,
+        sampling_input_ids = torch.full(
+            (len(sample_sequences), alloc_len),
+            raw_gpt_model.pad_token_id,
+            dtype=torch.long,
+            device=device
         )
+        for i, ids in enumerate(initial_input_ids_list):
+            if ids:
+                sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+        with torch.inference_mode(), ctx:
+            eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+            _ = eager_gpt_model(
+                sampling_input_ids,
+                attn_mask=None,
+                ignore_doc_mask=True,
+                document_ids=None,
+            )
 
     torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
 
     # hellaswag-shape warmup
-    raw_gpt_model.eval()
-    hellaswag_examples_per_batch = 16
-    max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
+    if training_config.run_benchmarks:
+        raw_gpt_model.eval()
+        hellaswag_examples_per_batch = 16
+        max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
 
-    alloc_len = min(1024, raw_gpt_model.max_seq_len)
+        alloc_len = min(1024, raw_gpt_model.max_seq_len)
 
-    pre_allocated_input_ids = torch.full(
-        (max_gpu_sequences_per_batch, alloc_len),
-        raw_gpt_model.pad_token_id,
-        dtype=torch.long,
-        device=device
-    )
-
-    with torch.inference_mode(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        _ = raw_gpt_model(
-            pre_allocated_input_ids,
-            attn_mask=None,
-            ignore_doc_mask=True,
-            document_ids=None,
+        pre_allocated_input_ids = torch.full(
+            (max_gpu_sequences_per_batch, alloc_len),
+            raw_gpt_model.pad_token_id,
+            dtype=torch.long,
+            device=device
         )
+
+        with torch.inference_mode(), ctx:
+            _ = raw_gpt_model(
+                pre_allocated_input_ids,
+                attn_mask=None,
+                ignore_doc_mask=True,
+                document_ids=None,
+            )
 
     torch.cuda.synchronize()
     if dist.is_initialized():
@@ -3282,6 +3579,9 @@ try:
         training_config.max_tokens
     )
 
+    lr_schedule_idx = 0
+    next_lr_update_tokens = lr_schedule[lr_schedule_idx]["end"]
+
     for step in range(start_step, max_train_steps):
         
         torch.cuda.synchronize()
@@ -3311,7 +3611,7 @@ try:
             if doc_ids_train is not None:
                 doc_ids_train = doc_ids_train[:current_batch_size].pin_memory().to(device, non_blocking=True)
             gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            with ctx:
                 logits, step_train_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
             step_train_loss /= grad_accum_mini_steps
             train_loss += step_train_loss.detach()
@@ -3354,15 +3654,14 @@ try:
         # )
         # <-- Uncomment for gradient norm clipping -->
 
-        # update lr  
-        adamw_lr = get_token_based_adamw_lr(
-            train_tokens_processed,
-            lr_warmup_tokens,
-            lr_warmup_and_cosine_tokens,
-            total_decay_tokens,
-            adamw_max_lr,
-            adamw_hard_min_lr
-        )
+        # update lr
+        if train_tokens_processed >= next_lr_update_tokens:
+            if lr_schedule_idx + 1 < len(lr_schedule):
+                lr_schedule_idx += 1
+                next_lr_update_tokens = lr_schedule[lr_schedule_idx]["end"]
+        lr_spec = lr_schedule[lr_schedule_idx]
+        lr_tokens = train_tokens_processed - lr_spec["start"]
+        adamw_lr = lr_spec["fn"](lr_tokens, **lr_spec["kwargs"])
 
         # update SWA window size (token schedule)
         if train_tokens_processed >= next_swa_update_tokens:
@@ -3404,6 +3703,11 @@ try:
         train_step_t = end_train_t - start_train_t
         total_train_t += train_step_t
         total_t += train_step_t
+        
+        # obtain the actual tokens trained on this step (which can vary due to varying batch size)
+        # on all gpus (so each updates the schedule), *not just on master*
+        actual_tokens_this_step = current_batch_size * seq_len_train * ddp_world_size * grad_accum_mini_steps
+        train_tokens_processed += actual_tokens_this_step
 
         if master_process:
             # <-- Uncomment for logit soft-capping -->
@@ -3419,9 +3723,6 @@ try:
             if raw_gpt_model.use_qk_norm and raw_gpt_model.use_qk_debug_log:
                 qk_suffix = qk_scale_debug_string(raw_gpt_model)
 
-            # obtain the actual tokens trained on this step (which can vary due to varying batch size)
-            actual_tokens_this_step = current_batch_size * seq_len_train * ddp_world_size * grad_accum_mini_steps
-            train_tokens_processed += actual_tokens_this_step
             train_log_content = (
                 f"step: {step:,} | "
                 f"train loss: {tl:.8f} | "
@@ -3442,11 +3743,12 @@ try:
             #     f.write(train_log_content + "\n")
             log_buffer.append(train_log_content)
 
-        if (step % sample_interval == 0 and step > 0) or step == max_train_steps - 1:
+        if training_config.run_sampling and ((step % sample_interval == 0 and step > 0) or step == max_train_steps - 1):
             torch.cuda.synchronize()
             start_sample_t = time.time()
             max_new_tokens = get_sample_token_count(step)
-            sample(sample_sequences, max_new_tokens=max_new_tokens)
+            with ctx:
+                sample(sample_sequences, max_new_tokens=max_new_tokens)
             torch.cuda.synchronize()
             end_sample_t = time.time()
             sample_step_t = end_sample_t - start_sample_t
@@ -3457,10 +3759,11 @@ try:
                 print(message)
                 log_buffer.append(message)
 
-        if (step % hellaswag_interval == 0 and step > 0) or step == max_train_steps - 1:
+        if training_config.run_benchmarks and ((step % hellaswag_interval == 0 and step > 0) or step == max_train_steps - 1):
             torch.cuda.synchronize()
             start_hellaswag_t = time.time()
-            accuracy = evaluate_hellaswag_standard()
+            with ctx:
+                accuracy = evaluate_hellaswag_standard()
             torch.cuda.synchronize()
             end_hellaswag_t = time.time()
             hellaswag_step_t = end_hellaswag_t - start_hellaswag_t
@@ -3496,9 +3799,10 @@ try:
                     y_val = y_val.pin_memory().to(device, non_blocking=True)
                     if doc_ids_val is not None:
                         doc_ids_val = doc_ids_val.pin_memory().to(device, non_blocking=True)
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        _, step_val_loss = gpt_model(x_val, y_val, document_ids=doc_ids_val)
-                    val_loss += step_val_loss / val_steps
+                    _, step_val_loss = gpt_model(x_val, y_val, document_ids=doc_ids_val)
+                    # cast to float32 so accumulation and comparison stay in float32,
+                    # to avoid the target to be bf16-casted (e.g., to 3.28125)
+                    val_loss += step_val_loss.float() / val_steps
                 dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
 
             if val_loss < best_val_loss:
