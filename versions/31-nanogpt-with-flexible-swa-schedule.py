@@ -1,5 +1,6 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import sys
 import copy
 import math
 import time
@@ -25,6 +26,17 @@ from typing import Optional, Tuple, List, Dict, Any, Callable, Iterable, Sequenc
 
 # torchrun --standalone --nproc_per_node=4 versions/31-nanogpt-with-flexible-swa-schedule.py
 # Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+
+#######################################################################################################
+# step: 2,250 | train loss: 3.13983727 | train ppl: 23.10 | train step time: 172.44 ms |              #
+# adamw lr: 0.00075289 | tok/s: 1,520,239.40 | total toks: 590,086,144 | total train time: 5.77 min | #
+# sw size: 1536 | max q_scale raw/eff: 1.9515/1.9515 | max k_scale raw/eff: 1.9525/1.9525             #
+# resetting val loader at step 2250                                                                   #
+# new best val loss: 3.27646255                                                                       #
+# step: 2,250 | val loss: 3.27646255 | val ppl: 26.48 | val time: 2,664.17 ms                         #
+# val loss 3.27646255 reached target 3.28                                                             #
+# 2.1 anywinter4079/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04-runpod-clone              #
+#######################################################################################################
 
 ################################################
 # 4 x H100 SXM | 56 vCPU 503 GB RAM | $10.86/h # 
@@ -183,9 +195,9 @@ class TrainingConfig:
     # validation
     val_target: float = 3.28
     val_tokens: int = 5 * 2**21 # 5 * 2**21 == 10_485_760
-    shuffle_val_tokens: bool = True # shuffle or first 10_485_760 tokens of the FineWeb validation shard for the NanoGPT Speedrun
+    shuffle_val_tokens: bool = False # shuffle or first 10_485_760 tokens of the FineWeb validation shard for the NanoGPT Speedrun
     val_interval: int = 50
-    train_val_margin: float = 0.075 # to save compute, start running validation when training loss + train_val_margin <= val_target
+    train_val_margin: float = -9.0 # to save compute, start running validation when training loss + train_val_margin <= val_target
 
     # sampling
     sample_interval: int = 4000
@@ -2557,6 +2569,15 @@ kernel_warmup_train_steps = training_config.kernel_warmup_train_steps
 log_buffer = []
 
 if master_process:
+    log_buffer.append(f"python: {sys.version}")
+    log_buffer.append(f"torch: {torch.__version__}")
+    log_buffer.append(f"torch.cuda: {torch.version.cuda}")
+    log_buffer.append("=" * 100)
+    with open(sys.argv[0], "r") as f:
+        log_buffer.append(f.read())
+    log_buffer.append("=" * 100)
+
+if master_process:
     message = f"per-gpu gradient accumulation mini-steps: {grad_accum_mini_steps}"
     print(message)
     log_buffer.append(message)
@@ -3058,7 +3079,7 @@ try:
                 f"adamw lr: {adamw_lr:.8f} | "
                 f"tok/s: {total_tokens_per_step_train / train_step_t:,.2f} | "
                 f"total toks: {train_tokens_processed:,} | "
-                f"total time: {total_t/60:,.2f} min | "
+                f"total train time: {total_train_t/60:,.2f} min | "
                 f"{sw_size_suffix} | "
                 f"{qk_suffix}"
                 # f"{logits_suffix}"
