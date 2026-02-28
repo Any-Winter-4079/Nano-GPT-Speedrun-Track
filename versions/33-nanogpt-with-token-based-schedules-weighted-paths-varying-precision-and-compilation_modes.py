@@ -113,7 +113,7 @@ class GPTConfig:
 @dataclass
 class TrainingConfig:
     # steps and tokens
-    total_tokens_per_step_train: int = 2**18 # 2**19 == 524_288 or ~0.5M tokens from Language Models are Few-Shot Learners
+    total_tokens_per_step_train: int = 2**18 # for max batch size, 2**19 == 524_288 or ~0.5M tokens from Language Models are Few-Shot Learners
     # 32 * 2048 → 65_536 tokens
     # up to 4 gpus →
     #   65_536 * 1 → 65_536 tokens  → grad_accum_mini_steps = 4 (for 2**18 == 262_144 step tokens)
@@ -264,7 +264,10 @@ class TrainingConfig:
     kernel_warmup_train_steps: int = 2
 
     # torch compile
-    torch_compile_mode: str = "max-autotune" # "max-autotune" | "reduce-overhead" | "max-autotune-no-cudagraphs" | "default"
+    # NOTE: workaround for RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run is 
+    # to disable cudagraphs in max-autotune when grad_accum_mini_steps > 1
+    torch_compile_mode_no_grad_accum: str = "max-autotune" # "max-autotune" | "reduce-overhead" | "max-autotune-no-cudagraphs" | "default"
+    torch_compile_mode_grad_accum: str = "max-autotune-no-cudagraphs" # "max-autotune" | "reduce-overhead" | "max-autotune-no-cudagraphs" | "default"
     torch_compile_fullgraph: bool = True
     torch_compile_dynamic: bool = False
 
@@ -302,6 +305,7 @@ class TrainingConfig:
     grad_accum_mini_steps: int = field(init=False)
     total_tokens_per_step_val: int = field(init=False)
     val_steps: int = field(init=False)
+    torch_compile_mode: str = field(init=False)
 
     def resolve(self, ddp_world_size: int) -> None:
         # bf16
@@ -324,6 +328,11 @@ class TrainingConfig:
         self.total_tokens_per_step_val = ddp_world_size * self.gpu_batch_size_val * self.seq_len_val
         self.val_steps = math.ceil(self.val_tokens / self.total_tokens_per_step_val)
         self.total_decay_tokens = self.lr_warmup_and_cosine_tokens - self.lr_warmup_tokens
+        self.torch_compile_mode = (
+            self.torch_compile_mode_no_grad_accum
+            if self.grad_accum_mini_steps == 1
+            else self.torch_compile_mode_grad_accum
+        )
 
         # batch size schedule
         keys_schedule = self.batch_size_keys_schedule
@@ -3024,9 +3033,7 @@ ddp_world_size = int(os.environ['WORLD_SIZE'])
 device_type = "cuda"
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
-# in torch 2.10 cuda 12.8,you can get rid of the warning with
-# init_process_group(backend='nccl', device_id=ddp_local_rank)
-init_process_group(backend='nccl')
+init_process_group(backend='nccl', device_id=ddp_local_rank)
 master_process = ddp_rank == 0
 
 training_config = TrainingConfig()
@@ -3347,6 +3354,7 @@ def save_config_info() -> None:
         f.write(f"val_steps: {val_steps}\n")
         f.write(f"max_train_steps: {max_train_steps}\n")
         f.write(f"total_decay_tokens: {total_decay_tokens}\n")
+        f.write(f"torch_compile_mode: {training_config.torch_compile_mode}\n")
 
         f.write("\n################")
         f.write("\n# Model Config #")
@@ -3444,6 +3452,8 @@ def _kernel_warmup(num_train_steps: int = 2) -> None:
                     with ctx:
                         _, warm_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
 
+                    # Detach storage from cudagraph-managed forward outputs before backward.
+                    warm_loss = warm_loss.clone()
                     (warm_loss / grad_accum_mini_steps).backward()
 
                 for optimizer in optimizers.values():
@@ -3612,7 +3622,9 @@ try:
                 doc_ids_train = doc_ids_train[:current_batch_size].pin_memory().to(device, non_blocking=True)
             gpt_model.require_backward_grad_sync = (mini_step == grad_accum_mini_steps - 1)
             with ctx:
-                logits, step_train_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+                _, step_train_loss = gpt_model(x_train, y_train, document_ids=doc_ids_train)
+            # Detach storage from cudagraph-managed forward outputs before backward.
+            step_train_loss = step_train_loss.clone()
             step_train_loss /= grad_accum_mini_steps
             train_loss += step_train_loss.detach()
             step_train_loss.backward()
