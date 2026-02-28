@@ -10,6 +10,7 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 - [Nov 2, 2025, World record <= 3.28 val loss on the first 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
 
 ## Updates
+
 - While I haven't had much time to play around with this repo lately, I have added 2 new versions, improving this repo's best time to X, now also on the same 10M tokens the official speedrun uses.
 - In this time, the official speedrun [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) has improved another 30% in 2 months and are already at 1.540 minutes (Feb 9th, 2026). Go check them out!
 
@@ -53,139 +54,163 @@ On RunPod, create the following secrets if you want to push your results (and mo
 
 If you use your own hardware, create them as environment variables
 
-### 2. Choose/create a (RunPod) template, or pull a Docker image
+### 2. (Optional) Create a Docker Image
 
-If you use your own hardware, you can:
+I currently use:
 
-Use one of the following Docker images (first is the official image, second is a personal backup/clone for my own future sanity, in the rare event RunPod deleted the image, etc.):
+- [anywinter4079/pytorch:2.10.0-cu128](https://console.runpod.io/deploy?template=undhxj45z6&ref=xqdrabty) for `versions/33-*`, `versions/34-*`, and `train.py` (PyTorch 2.10.0, CUDA 12.8)
+- [anywinter4079/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04-runpod-clone](https://console.runpod.io/deploy?template=14umdte6u7&ref=xqdrabty) for earlier versions (PyTorch 2.8.0, CUDA 12.8.1)
 
-- `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04`
-- `anywinter4079/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04-runpod-clone`
+The `2.10.0-cu128` image is built from `anywinter4079/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04-runpod-clone` (clone/backup of the official `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04`) with extra dependencies (`tiktoken` `datasets` `tqdm` `huggingface_hub` `safetensors`) and an upgrade to PyTorch `2.10.0+cu128`.
 
-Or manually match that config (e.g., Python 3.11, CUDA 12.8.1, etc.) on your own system, or try your system as-is (no guarantees)
-
-If you need third-party hardware, you will want a Docker image, some container/volume disk space, and an SSH connection.
-On RunPod:
-
-Feel free to create your own template, or [deploy my template](https://console.runpod.io/deploy?template=undhxj45z6&ref=xqdrabty) (Disclaimer: I theoretically get 1% of earnings generated from my template, but the main reason for creating it is to more quickly deploy each time -feel free to create a new one, clone mine, etc.). The template I created uses config:
-
-1. Container Image: anywinter4079/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04-runpod-clone
-2. Container Disk: 250 GB
-3. Volume Disk: 500 GB
-4. Volume Mount Path: /workspace
-5. TCP Ports (max 10): Port label: SSH, Port number: 22
-
-If you create your own template, you may want to use RunPod's official container image:
+To build and push the image, I used:
 
 ```
-runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+mkdir -p docker_build && \
+cat > docker_build/Dockerfile <<'EOF'
+FROM anywinter4079/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04-runpod-clone
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y nano && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip \
+ && pip install tiktoken datasets tqdm huggingface_hub safetensors
+
+# torch 2.10.0+cu128 (CUDA 12.8)
+RUN pip install torch==2.10.0+cu128 \
+ --index-url https://download.pytorch.org/whl/cu128 --upgrade
+EOF
 ```
 
-After you have the template (mine or your own), deploy, setting `hf_user` and `hf_token` as Environment variables (note `hf_user` and `hf_token` are added as Environment variables on the deployment page, and not to the template itself, in case the template is made public -e.g., my template is public-). To deploy a template on RunPod:
+And then:
 
-1. On Deploy a Pod: Choose `H100 XSM` (on `All North America` they seem to be faster/more reliable) and click `Edit Template`
-2. Select your GPU count
-3. Click `Edit`
-4. Click `Environment Variables`
-5. Click `+ Add Environment Variable`
-6. Click Lock icon to select secret
-7. Click `hf_token` to select it as value
-8. Type `hf_token` to choose it as key
-9. Click `+ Add Environment Variable`
-10. Click Lock icon to select secret
-11. Click `hf_user` to select it as value
-12. Type `hf_user` to choose it as key
-13. Click `Set Overrides`
-14. Click `Deploy On-Demand`
+```
+docker login
+```
 
-Finally, connect to the RunPod template via SSH (without SCP & SFTP support), running on your Terminal the provided command, in the following format (replacing `<CONNECTION_STRING>` and `<PRIVATE_KEY_FILE>` with those provided by RunPod):
+With:
+
+```
+docker buildx use amd64-builder
+docker buildx build --platform linux/amd64 -t anywinter4079/pytorch:2.10.0-cu128 ./docker_build --push
+```
+
+If `amd64-builder` already exists (e.g., have run the command before), or:
+
+```
+docker buildx create --use --name amd64-builder
+docker buildx build --platform linux/amd64 -t anywinter4079/pytorch:2.10.0-cu128 ./docker_build --push
+```
+
+otherwise.
+
+If you want to reuse the existing image, there is nothing to do in this step. Else, you can follow these steps to create your own, if you ever want to change the image.
+
+### 3. (Optional) Create a network volume to host the Fineweb-Edu data
+
+To create a persistent network volume to host the ~20GB of data ($1.40/mo) for instant access upon pod spinup:
+
+Clone and `cd` into this repo:
+
+```
+git clone https://github.com/Any-Winter-4079/Nano-GPT-Speedrun-Track.git && \
+cd Nano-GPT-Speedrun-Track
+```
+
+Download the Fineweb-Edu dataset (locally):
+
+```
+cd data && python fineweb-npy.py
+```
+
+Create a Network volume on Runpod:
+
+1. Click `Storage` (left menu)
+2. Click `+ New Network Volume`
+3. Choose a datacenter with H100 SXM(s) available
+4. Set the size to 20 GB
+5. Click Create Network Volume
+
+Start a CPU pod (cheaper) on the same datacenter where the network volume is hosted:
+
+1. Click `Storage` (left menu)
+2. Click the volume
+3. Click `Configure Pod with Volume`
+4. Click `Edit Pod`
+5. Change `Volume Mount Path` from `/workspace` to `/workspace/data/edu_fineweb10B`
+6. Click `Set Overrides`
+7. Click `Deploy On-Demand`
+
+Then securely copy (`scp`) the data from your local computer to the remote network volume, replacing `<PORT>`, `<PRIVATE_KEY_FILE>`, `<IP>` with those from `Connect`:
+
+```
+scp -P <PORT> -i ~/.ssh/<PRIVATE_KEY_FILE> -r \
+    data/edu_fineweb10B/* \
+    root@<IP>:/workspace/data/edu_fineweb10B/
+```
+
+### 4. Pretrain
+
+To pre-train, terminate the CPU pod, and spin up a pod with one or more H100 SXM(s), and add `hf_user` and `hf_token` (if you want to push your final model/training logs to the Hub), i.e.:
+
+1. Click `Edit`
+2. Click `Environment Variables`
+3. Click `+ Add Environment Variable`
+4. Click Lock icon to select secret
+5. Click `hf_token` to select it as value
+6. Type `hf_token` to choose it as key
+7. Click `+ Add Environment Variable`
+8. Click Lock icon to select secret
+9. Click `hf_user` to select it as value
+10. Type `hf_user` to choose it as key
+11. Change `Volume Mount Path` from `/workspace` to `/workspace/data/edu_fineweb10B`
+12. Click `Set Overrides`
+13. Click `Deploy On-Demand`
+
+Connect to the pod via ssh (replacing `<CONNECTION_STRING>`, `<PRIVATE_KEY_FILE>` with those provided by Runpod):
 
 ```
 ssh <CONNECTION_STRING>@ssh.runpod.io -i ~/.ssh/<PRIVATE_KEY_FILE>
 ```
 
-### 3. Install requirements and download `edu_fineweb10B`
-
-To set up the remote machine, before pre-training:
-
-1. Run:
+Fetch the remote repo initializing a local repo beforehand to combine the `data/` folders (replacing `<your-user>` with your GitHub username), running the following within the workspace (cd `workspace` if needed):
 
 ```
-cd /workspace && \
-apt update && \
-apt install -y nano && \
-mkdir data && \
+git init && \
+git remote add origin https://github.com/<your-user>/Nano-GPT-Speedrun-Track.git && \
+git remote add upstream https://github.com/Any-Winter-4079/Nano-GPT-Speedrun-Track.git && \
+git fetch origin && \
+git checkout -b main origin/main
+```
+
+or in my case:
+
+```
+git init && \
+git remote add origin https://github.com/Any-Winter-4079/Nano-GPT-Speedrun-Track.git && \
+git fetch origin && \
+git checkout -b main origin/main
+```
+
+Then either check the network volume has been successfully attached:
+
+```
+ls data/edu_fineweb10B
+```
+
+Or download the data within the pod (if you skipped step 3):
+
+```
 cd data && \
-nano fineweb-npy.py
-```
-
-2. Add `fineweb-npy.py`'s content (from this repo)
-
-3. Save (e.g., `control + x`, `y`, `enter`)
-
-4. Run:
-
-```
-python -m pip install --upgrade pip && \
-pip install tiktoken datasets tqdm huggingface_hub safetensors && \
-python fineweb-npy.py
-```
-
-Alternatively, for steps 2 and 3, you could (on RunPod's `workspace`):
-
-```
-git clone https://github.com/Any-Winter-4079/GPT-3-Small-Pretraining-Experiments.git
-```
-
-to get _all code versions_ into the workspace (if you want to test multiple or do not mind the bloating)
-
-Or clone the repo locally:
-
-```
-git clone https://github.com/Any-Winter-4079/GPT-3-Small-Pretraining-Experiments.git
-```
-
-`cd` into it:
-
-```
-cd GPT-3-Small-Pretraining-Experiments
-```
-
-and, on another Terminal window (locally, keeping the other SSH session open), send the files via `scp`, e.g., with (replacing `<PORT>`, `<PRIVATE_KEY_FILE>` and `<IP>` with the values from 'SSH over exposed TCP' on RunPod, and replacing `30-gpt-3-small-with-training-config-and-with-or-without-swa-window-size-ramp.py` with the version you want to send to run):
-
-```
-scp -P <PORT> -i ~/.ssh/<PRIVATE_KEY_FILE> -r \
-    versions/30-gpt-3-small-with-training-config-and-with-or-without-swa-window-size-ramp.py \
-    input.txt \
-    data \
-    push_to_hub.py \
-    root@<IP>:/workspace/
-```
-
-Alternatively, use `train.py` for the latest script version.
-
-## Pre-training
-
-Finally, to pre-train, `cd` out of the `data/` directory (on RunPod):
-
-```
+python fineweb-npy.py && \
 cd ..
 ```
 
-And either create the file (e.g., `30.py` for brevity) or if you already have it because you have `git clone`'d the repo or `scp`'d the file, go directly to running `torchrun`, specifying your GPU count, and the file name you want to run, e.g.:
+Finally, run (replacing `4` with the number of GPUs you decided to use):
 
 ```
-nano 30.py
-```
-
-Add `versions/30-gpt-3-small-with-training-config-and-with-or-without-swa-window-size-ramp.py`'s content (from this repo)
-
-Save (e.g., `control + x`, `y`, `enter`)
-
-And run:
-
-```
-torchrun --standalone --nproc_per_node=4 30.py
+torchrun --standalone --nproc_per_node=4 train.py
 ```
 
 You should see a log similar to:
@@ -232,48 +257,19 @@ step: 5 | train loss: 7.81453323 | train ppl: 2,476.33 | train step time: 154.13
 ...
 ```
 
-## Pushing the logs and checkpoints to Hugging Face
+## 5. (Optional) Store `stdout` and `stderr` logs on file (if you run updates to the code and the log is too long to be read on the shell)
 
-To push the config, log, and model(s) (if checkpointing), find the latest timestamp, either on `checkpoints` or `configs_and_logs`:
-
-```
-cd checkpoints
-```
-
-Copy the timestamp
-
-```
-cd ..
-```
-
-Create `push_to_hub.py` (adding its content from this repo) and/or edit it (e.g., if you have `scp`'d the script):
-
-```
-nano push_to_hub.py
-```
-
-Replacing the `timestamp` `("20251013_145053")` with your timestamp (**TODO**: make the script ask for the timestamp as input when running)
-
-Save (e.g., `control + x`, `y`, `enter`)
-
-And run:
-
-```
-python push_to_hub.py
-```
-
-## Storing `stdout` and `stderr` on file (if you ever need to)
-
-Because error messages can be **very** long, you can run (replacing `--nproc_per_node=1` with you GPU count):
+Because error messages can be **very** long, you can run (replacing `--nproc_per_node=4` with you GPU count):
 
 ```
 mkdir debug
 ```
 
 ```
-PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=1 30.py \
-  > >(stdbuf -oL tee -a debug/out-$(date +%F_%H-%M-%S).log) \
-  2> >(stdbuf -oL tee -a debug/err-$(date +%F_%H-%M-%S).log >&2)
+PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=1 train.py \
+
+> > (stdbuf -oL tee -a debug/out-$(date +%F_%H-%M-%S).log) \
+  2> >(stdbuf -oL tee -a debug/err-$(date +%F\_%H-%M-%S).log >&2)
 ```
 
 Then review the error message in chunks (replacing `err-2025-10-25_00-32-19.log` with your own log):
@@ -281,4 +277,22 @@ Then review the error message in chunks (replacing `err-2025-10-25_00-32-19.log`
 ```
 cd debug
 awk 'NR>=0 && NR<=180' err-2025-10-25_00-32-19.log
+```
+
+## 6. (Optional) Push the training config, logs, and checkpoint(s) to Hugging Face
+
+To push the config, log, and model(s) (if checkpointing), find the latest timestamp, either on `checkpoints` or `configs_and_logs`, e.g.:
+
+```
+ls checkpoints
+```
+
+Then copy the timestamp and replace (with `nano train.py`) `push_to_hub.py`'s `timestamp` `("20251013_145053")` with your timestamp (**TODO**: make the script ask for the timestamp as input when running)
+
+Save (e.g., `control + x`, `y`, `enter`)
+
+And run:
+
+```
+python push_to_hub.py
 ```
