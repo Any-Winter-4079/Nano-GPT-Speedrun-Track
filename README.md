@@ -257,7 +257,7 @@ step: 5 | train loss: 7.81453323 | train ppl: 2,476.33 | train step time: 154.13
 ...
 ```
 
-## 5. (Optional) Store `stdout` and `stderr` logs on file (if you run updates to the code and the log is too long to be read on the shell)
+### 5. (Optional) Store `stdout` and `stderr` logs on file (if you run updates to the code and the log is too long to be read on the shell)
 
 Because error messages can be **very** long, you can run (replacing `--nproc_per_node=4` with you GPU count):
 
@@ -279,7 +279,7 @@ cd debug
 awk 'NR>=0 && NR<=180' err-2025-10-25_00-32-19.log
 ```
 
-## 6. (Optional) Push the training config, logs, and checkpoint(s) to Hugging Face
+### 6. (Optional) Push the training config, logs, and checkpoint(s) to Hugging Face
 
 To push the config, log, and model(s) (if checkpointing), find the latest timestamp, either on `checkpoints` or `configs_and_logs`, e.g.:
 
