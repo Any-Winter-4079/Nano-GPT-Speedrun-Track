@@ -29,7 +29,12 @@ from typing import Optional, Tuple, List, Dict, Any, Callable, Iterable, Sequenc
 # pip install tiktoken huggingface_hub safetensors
 
 # torchrun --standalone --nproc_per_node=4 versions/33-nanogpt-with-token-based-schedules-weighted-paths-varying-precision-and-compilation_modes.py
-# Note: torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+# NOTE: 
+# 1) torchrun sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+# 2) model wrappers:
+# gpt_model = DDP(compiled GPT), where DDP handles cross-gpu gradient sync/all-reduce
+# raw_gpt_model = gpt_model.module, which removes only the DDP wrapper (still compiled)
+# raw_gpt_model._orig_mod removes the compile wrapper too and runs eager GPT
 
 ################################################
 # 4 x H100 SXM | 56 vCPU 503 GB RAM | $10.86/h #
@@ -2655,7 +2660,8 @@ def evaluate_hellaswag_one_shot(hellaswag_examples_per_batch: int = 16) -> float
             with ctx:
                 # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
                 # so we can skip passing an attn_mask
-                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
+                eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+                logits, _ = eager_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             
             # log softmax: softmax followed by log (to sum log-probs vs. multiply low-value probs)
             log_probs = F.log_softmax(logits, dim=-1)
@@ -2799,7 +2805,8 @@ def evaluate_hellaswag_standard(hellaswag_examples_per_batch: int = 16) -> float
             with ctx:
                 # NOTE: for decoding and right padding, tokens cannot attend to padding anyway
                 # so we can skip passing an attn_mask
-                logits, _ = raw_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
+                eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
+                logits, _ = eager_gpt_model(pre_allocated_input_ids, attn_mask=None, ignore_doc_mask=True)
             
             log_probs = F.log_softmax(logits, dim=-1)
 
@@ -3488,69 +3495,7 @@ def _kernel_warmup(num_train_steps: int = 2) -> None:
     if dist.is_initialized():
         dist.barrier()
 
-    # sampling-shape warmup
-    if training_config.run_sampling:
-        raw_gpt_model.eval()
-        max_new_tokens = get_sample_token_count(start_step)
-        max_allowed_input_len = raw_gpt_model.max_seq_len - max_new_tokens
-        initial_input_ids_list = [
-            tokenizer.encode(sequence)[:max_allowed_input_len] 
-            for sequence in sample_sequences
-        ]
-        max_input_len = max(1, max(len(ids) for ids in initial_input_ids_list))
-        alloc_len = max_input_len + max_new_tokens
-        round_multiple = raw_gpt_model.flex_block_size if raw_gpt_model.use_flex_attention else 8
-        alloc_len = min(raw_gpt_model.max_seq_len, math.ceil(alloc_len / round_multiple) * round_multiple)
-
-        sampling_input_ids = torch.full(
-            (len(sample_sequences), alloc_len),
-            raw_gpt_model.pad_token_id,
-            dtype=torch.long,
-            device=device
-        )
-        for i, ids in enumerate(initial_input_ids_list):
-            if ids:
-                sampling_input_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-
-        with torch.inference_mode(), ctx:
-            eager_gpt_model = raw_gpt_model._orig_mod if hasattr(raw_gpt_model, "_orig_mod") else raw_gpt_model
-            _ = eager_gpt_model(
-                sampling_input_ids,
-                attn_mask=None,
-                ignore_doc_mask=True,
-                document_ids=None,
-            )
-
-    torch.cuda.synchronize()
-    if dist.is_initialized():
-        dist.barrier()
-
-    # hellaswag-shape warmup
-    if training_config.run_benchmarks:
-        raw_gpt_model.eval()
-        hellaswag_examples_per_batch = 16
-        max_gpu_sequences_per_batch = hellaswag_examples_per_batch * 4
-
-        alloc_len = min(1024, raw_gpt_model.max_seq_len)
-
-        pre_allocated_input_ids = torch.full(
-            (max_gpu_sequences_per_batch, alloc_len),
-            raw_gpt_model.pad_token_id,
-            dtype=torch.long,
-            device=device
-        )
-
-        with torch.inference_mode(), ctx:
-            _ = raw_gpt_model(
-                pre_allocated_input_ids,
-                attn_mask=None,
-                ignore_doc_mask=True,
-                document_ids=None,
-            )
-
-    torch.cuda.synchronize()
-    if dist.is_initialized():
-        dist.barrier()
+    # sampling/hellaswag warmup is skipped because both run via _orig_mod eager path
 
     # restore state
     raw_gpt_model.load_state_dict(model_state)
@@ -3755,8 +3700,7 @@ try:
             torch.cuda.synchronize()
             start_sample_t = time.time()
             max_new_tokens = get_sample_token_count(step)
-            with ctx:
-                sample(sample_sequences, max_new_tokens=max_new_tokens)
+            sample(sample_sequences, max_new_tokens=max_new_tokens)
             torch.cuda.synchronize()
             end_sample_t = time.time()
             sample_step_t = end_sample_t - start_sample_t
@@ -3770,8 +3714,7 @@ try:
         if training_config.run_benchmarks and ((step % hellaswag_interval == 0 and step > 0) or step == max_train_steps - 1):
             torch.cuda.synchronize()
             start_hellaswag_t = time.time()
-            with ctx:
-                accuracy = evaluate_hellaswag_standard()
+            accuracy = evaluate_hellaswag_standard()
             torch.cuda.synchronize()
             end_hellaswag_t = time.time()
             hellaswag_step_t = end_hellaswag_t - start_hellaswag_t
