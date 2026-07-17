@@ -6,12 +6,12 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 
 ## Measurements
 
-- Repo's best time to reach <= 3.28 val loss on 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.87 minutes (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100).
+- Repo's best time to reach <= 3.28 val loss on the first 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.98 minutes (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100).
 - [Nov 2, 2025, World record <= 3.28 val loss on the first 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
 
 ## Updates
 
-- While I haven't had much time to play around with this repo lately, I have added 2 new versions, improving this repo's best time to X, now also on the same 10M tokens the official speedrun uses.
+- While I haven't had much time to play around with this repo lately, I have added 2 new versions, improving this repo's best time to 4.98 minutes (4x H100 SXM), now also on the same 10M tokens the official speedrun uses.
 - In this time, the official speedrun [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) has improved another 30% in 2 months and are already at 1.540 minutes (Feb 9th, 2026). Go check them out!
 
 ### WR vs This Repo Differences
@@ -25,14 +25,6 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 ### GPU benchmarking (Runpod)
 
 <img width="1000" alt="gpt-cuda-gpu-speed-cost-plot" src="https://github.com/user-attachments/assets/a219faf3-b835-446b-a8b7-c7e435c47609" />
-
-## Possible improvements
-
-- KV cache (for `sample`)
-- Mixture of Experts config option
-- Masked Language Model (MLM) training support (`is_causal=False` -> work as encoder)
-- Reward >1 token at the start of training (e.g., I went `swimming` -> reward `swimming`, `running`, `walking`, etc.) and sharpen signal as training goes on
-- ...
 
 ## Instructions
 
@@ -281,18 +273,20 @@ awk 'NR>=0 && NR<=180' err-2025-10-25_00-32-19.log
 
 ### 6. (Optional) Push the training config, logs, and checkpoint(s) to Hugging Face
 
-To push the config, log, and model(s) (if checkpointing), find the latest timestamp, either on `checkpoints` or `configs_and_logs`, e.g.:
+To push the config, log, and model(s) (if checkpointing), either provide a timestamp explicitly:
 
 ```
-ls checkpoints
+python push_to_hub.py --timestamp 20260211_180749
 ```
 
-Then copy the timestamp and replace (with `nano train.py`) `push_to_hub.py`'s `timestamp` `("20251013_145053")` with your timestamp (**TODO**: make the script ask for the timestamp as input when running)
-
-Save (e.g., `control + x`, `y`, `enter`)
-
-And run:
+Or let the script auto-pick the latest timestamp from `./configs_and_logs` and `./checkpoints`:
 
 ```
 python push_to_hub.py
+```
+
+Optional: include metadata in the Hub repo name (GPU count, final val loss, and total train minutes parsed from logs/config):
+
+```
+python push_to_hub.py --timestamp 20260211_180749 --with-metrics-in-name
 ```
