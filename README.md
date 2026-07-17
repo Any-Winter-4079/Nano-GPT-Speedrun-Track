@@ -6,13 +6,14 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 
 ## Measurements
 
-- Repo's best time to reach <= 3.28 val loss on the first 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.98 minutes (we would need to change `total_tokens_per_step_train/val` (262,144), `gpu_batch_size` (8), or `seq_len_train/val` (8,192) to use 8x NVIDIA H100).
+- Repo's best time to reach <= 3.28 val loss on the first 10,485,760 validation tokens (4x NVIDIA H100 SXM): 4.98 minutes.
 - [Nov 2, 2025, World record <= 3.28 val loss on the first 10,485,760 validation tokens](https://github.com/KellerJordan/modded-nanogpt?tab=readme-ov-file#world-record-history) (8x NVIDIA H100 SXM): 2.345 minutes
 
 ## Updates
 
 - While I haven't had much time to play around with this repo lately, I have added 2 new versions, improving this repo's best time to 4.98 minutes (4x H100 SXM), now also on the same 10M tokens the official speedrun uses.
 - In this time, the official speedrun [modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt) has improved another 30% in 2 months and are already at 1.540 minutes (Feb 9th, 2026). Go check them out!
+- July 2026. Final update: I have continued to work on other projects for the last 6 months, and while I learned a lot playing with the speedrun, this repo is now archived. Future updates will move to a new repo to modularize the different components, and with more intelligence-based rather than speed-based updates.
 
 ### WR vs This Repo Differences
 
