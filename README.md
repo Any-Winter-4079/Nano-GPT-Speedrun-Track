@@ -22,6 +22,8 @@ Every new file in `versions/` adds some new functionality reflected in its name 
 ## Results
 
 ### Train/val loss
+<img width="1800" height="1050" alt="training-validation-loss" src="https://github.com/user-attachments/assets/8277d9c8-9169-42ef-a571-c76208cb1518" />
+
 
 ### GPU benchmarking (Runpod)
 
